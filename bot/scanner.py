@@ -128,6 +128,7 @@ async def _scan_roundtrip_dates(
         ],
         from_date=start.strftime("%Y-%m-%d"),
         to_date=end.strftime("%Y-%m-%d"),
+        duration=stay_days,
     )
     search = SearchDates()
     results = await asyncio.to_thread(
@@ -159,6 +160,19 @@ async def _scan_roundtrip_dates(
     return sorted(ranked, key=lambda x: x["price"])
 
 
+def _generate_outbound_dates(start: datetime, end: datetime, stay_days: int | None = None) -> list[dict]:
+    """Fallback date list when the calendar API returns nothing."""
+    dates = []
+    current = start
+    while current <= end:
+        entry = {"date": current.strftime("%Y-%m-%d")}
+        if stay_days:
+            entry["return_date"] = _return_date(entry["date"], stay_days)
+        dates.append(entry)
+        current += timedelta(days=1)
+    return dates
+
+
 async def scan_route_dates(
     from_code: str, to_code: str, days: int = DAYS_TO_SCAN, stay_days: int | None = None
 ) -> list[dict]:
@@ -173,13 +187,33 @@ async def scan_route_dates(
         if date_prices:
             return date_prices
         logger.warning(
-            "Round-trip calendar empty for %s -> %s (%sd), ranking outbound dates only",
+            "Round-trip calendar empty for %s -> %s (%sd), trying outbound calendar",
             from_code,
             to_code,
             stay_days,
         )
+        oneway_prices = await _scan_oneway_dates(from_code, to_code, tomorrow, end_date)
+        if oneway_prices:
+            for day in oneway_prices:
+                day["return_date"] = _return_date(day["date"], stay_days)
+            return oneway_prices
+        logger.warning(
+            "Outbound calendar also empty for %s -> %s (%sd), using generated dates",
+            from_code,
+            to_code,
+            stay_days,
+        )
+        return _generate_outbound_dates(tomorrow, end_date, stay_days)
 
-    return await _scan_oneway_dates(from_code, to_code, tomorrow, end_date)
+    oneway_prices = await _scan_oneway_dates(from_code, to_code, tomorrow, end_date)
+    if oneway_prices:
+        return oneway_prices
+    logger.warning(
+        "Calendar empty for %s -> %s, using generated outbound dates",
+        from_code,
+        to_code,
+    )
+    return _generate_outbound_dates(tomorrow, end_date)
 
 
 async def scan_flight_details(
@@ -281,7 +315,16 @@ async def scan_route(
         logger.warning(f"No flights matching stops preference for {from_code} -> {to_code}")
         return NO_MATCHES
 
-    calendar_prices = [d["price"] for d in date_prices]
+    calendar_prices = [d["price"] for d in date_prices if "price" in d]
+    detail_prices = [d["price"] for d in top_days]
+    if calendar_prices:
+        avg_price = sum(calendar_prices) / len(calendar_prices)
+        min_price = min(calendar_prices)
+        max_price = max(calendar_prices)
+    else:
+        avg_price = sum(detail_prices) / len(detail_prices)
+        min_price = min(detail_prices)
+        max_price = max(detail_prices)
 
     return ScanResult(
         from_airport=from_code.upper(),
@@ -294,8 +337,8 @@ async def scan_route(
         cheapest_duration=first_details["duration"] if first_details else None,
         cheapest_stops=first_details["stops"] if first_details else None,
         top_days=top_days,
-        avg_price=sum(calendar_prices) / len(calendar_prices),
-        min_price=min(calendar_prices),
-        max_price=max(calendar_prices),
+        avg_price=avg_price,
+        min_price=min_price,
+        max_price=max_price,
         stay_days=stay_days,
     )

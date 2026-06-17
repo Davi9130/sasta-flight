@@ -419,6 +419,8 @@ async def _scan_and_send(context: ContextTypes.DEFAULT_TYPE, route: dict, is_ret
     max_stops = await db.get_route_stops_preference(route["id"])
 
     stay_days = route.get("stay_days")
+    if stay_days is not None:
+        stay_days = int(stay_days)
 
     result = await scan_route(from_code, to_code, max_stops=max_stops, stay_days=stay_days)
 
@@ -435,13 +437,13 @@ async def _scan_and_send(context: ContextTypes.DEFAULT_TYPE, route: dict, is_ret
 
     if result is None:
         if is_retry:
-            msg = format_retry_failed_message(from_code, to_code)
+            msg = format_retry_failed_message(from_code, to_code, stay_days=stay_days)
             await context.bot.send_message(chat_id=CHAT_ID, text=msg)
         else:
             # Schedule retry only if interval > 4 hours
             interval = await db.get_route_scan_interval(route["id"])
             if interval > 240:
-                msg = format_error_message(from_code, to_code)
+                msg = format_error_message(from_code, to_code, stay_days=stay_days)
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg)
                 context.job_queue.run_once(
                     _retry_scan_job,

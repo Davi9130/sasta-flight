@@ -224,17 +224,35 @@ def format_history_message(
     return "\n".join(lines)
 
 
-def format_error_message(from_airport: str, to_airport: str) -> str:
+def format_error_message(
+    from_airport: str,
+    to_airport: str,
+    stay_days: int | None = None,
+) -> str:
+    route_label = (
+        f"{from_airport} ⇄ {to_airport} ({stay_days} days)"
+        if stay_days
+        else f"{from_airport} → {to_airport}"
+    )
     return (
-        f"⚠️ {from_airport} → {to_airport}\n"
+        f"⚠️ {route_label}\n"
         "Scan failed. Will retry in 4 hours.\n"
         "If this keeps happening, the flight data library may need updating."
     )
 
 
-def format_retry_failed_message(from_airport: str, to_airport: str) -> str:
+def format_retry_failed_message(
+    from_airport: str,
+    to_airport: str,
+    stay_days: int | None = None,
+) -> str:
+    route_label = (
+        f"{from_airport} ⇄ {to_airport} ({stay_days} days)"
+        if stay_days
+        else f"{from_airport} → {to_airport}"
+    )
     return (
-        f"❌ {from_airport} → {to_airport}\n"
+        f"❌ {route_label}\n"
         "Scan failed after retry. Will try again on next scheduled scan.\n"
         "Run /check to try manually."
     )

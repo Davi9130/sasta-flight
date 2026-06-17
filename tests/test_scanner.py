@@ -65,6 +65,7 @@ async def test_scan_route_dates_roundtrip(mock_date_results, cheapest_outbound_d
     call_args = MockSearch.return_value.search.call_args[0][0]
     from fli.models import TripType
     assert call_args.trip_type == TripType.ROUND_TRIP
+    assert call_args.duration == 10
     assert len(call_args.flight_segments) == 2
 
 
@@ -109,6 +110,19 @@ async def test_scan_route_roundtrip(mock_date_results, mock_flight_results, chea
 
 
 @pytest.mark.asyncio
+async def test_scan_route_dates_fallback_generates_dates():
+    tomorrow = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    end = tomorrow + timedelta(days=2)
+    with patch("bot.scanner._scan_roundtrip_dates", return_value=[]), \
+         patch("bot.scanner._scan_oneway_dates", return_value=[]):
+        result = await scan_route_dates("VIX", "MXP", days=2, stay_days=10)
+
+    assert len(result) == 3
+    assert result[0]["return_date"] == (tomorrow + timedelta(days=10)).strftime("%Y-%m-%d")
+    assert "price" not in result[0]
+
+
+@pytest.mark.asyncio
 async def test_scan_route_dates(mock_date_results, cheapest_outbound_date):
     with patch("bot.scanner.SearchDates") as MockSearch:
         MockSearch.return_value.search.return_value = mock_date_results
@@ -138,7 +152,9 @@ async def test_scan_route_dates_empty():
         MockSearch.return_value.search.return_value = []
         result = await scan_route_dates("ATQ", "BOM", days=7)
 
-    assert result == []
+    assert len(result) == 8
+    assert result[0]["date"]
+    assert "price" not in result[0]
 
 
 @pytest.mark.asyncio
