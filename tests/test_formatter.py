@@ -26,6 +26,53 @@ def test_flight_url_no_stops_same_as_any():
     assert url_none == url_any
 
 
+def test_flight_url_roundtrip_differs_from_oneway():
+    url_ow = _flight_url("VIX", "MXP", "2026-03-18")
+    url_rt = _flight_url("VIX", "MXP", "2026-03-18", return_date="2026-03-28")
+    assert url_ow != url_rt
+
+
+def test_format_daily_message_roundtrip():
+    result = ScanResult(
+        from_airport="VIX",
+        to_airport="MXP",
+        cheapest_price=4500,
+        cheapest_travel_date="2026-03-18",
+        cheapest_return_date="2026-03-28",
+        cheapest_airline="TAP",
+        cheapest_departure="08:30 PM",
+        cheapest_duration=735,
+        cheapest_stops=1,
+        top_days=[
+            {"date": "2026-03-18", "return_date": "2026-03-28", "price": 4500},
+        ],
+        avg_price=5100,
+        min_price=4500,
+        max_price=6200,
+        stay_days=10,
+    )
+    msg = format_daily_message(result)
+    assert "VIX ⇄ MXP" in msg
+    assert "10-day stay" in msg
+    assert "Mar 18" in msg
+    assert "Mar 28" in msg
+    assert "4,500" in msg
+
+
+def test_format_history_message_roundtrip():
+    history = [
+        {
+            "scan_date": "2026-03-07",
+            "cheapest_travel_date": "2026-03-18",
+            "cheapest_return_date": "2026-03-28",
+            "cheapest_price": 4500,
+        },
+    ]
+    msg = format_history_message("VIX", "MXP", history, stay_days=10)
+    assert "VIX ⇄ MXP" in msg
+    assert "Mar 28" in msg
+
+
 def test_format_daily_message_basic():
     result = ScanResult(
         from_airport="ATQ",
@@ -168,3 +215,25 @@ def test_format_daily_message_contains_book_links():
     assert "google.com/travel/flights" in msg
     # Each top day should have a link
     assert msg.count("[Book →]") == 2
+
+
+@pytest.mark.parametrize(
+    ("currency", "symbol", "expected"),
+    [
+        ("BRL", "R$", "R$3,200"),
+        ("USD", "$", "$3,200"),
+        ("EUR", "€", "€3,200"),
+        ("GBP", "£", "£3,200"),
+    ],
+)
+def test_format_price_currency_symbol(monkeypatch, currency, symbol, expected):
+    import importlib
+
+    monkeypatch.setenv("CURRENCY", currency)
+    import bot.config as config
+    import bot.formatter as formatter
+
+    importlib.reload(config)
+    importlib.reload(formatter)
+
+    assert formatter._format_price(3200) == expected

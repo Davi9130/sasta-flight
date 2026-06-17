@@ -1,15 +1,23 @@
 import base64
 from datetime import datetime
+from bot.config import CURRENCY, CURRENCY_SYMBOL
 from bot.scanner import ScanResult
 
 
 def _format_price(price: float) -> str:
-    return f"₹{price:,.0f}"
+    symbol = CURRENCY_SYMBOL[CURRENCY]
+    return f"{symbol}{price:,.0f}"
 
 
 def _format_date(date_str: str) -> str:
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     return dt.strftime("%b %d (%a)")
+
+
+def _format_trip_dates(outbound_date: str, return_date: str | None = None) -> str:
+    if return_date:
+        return f"{_format_date(outbound_date)} → {_format_date(return_date)}"
+    return _format_date(outbound_date)
 
 
 def _format_duration(minutes: int) -> str:
@@ -63,32 +71,51 @@ _URL_STOPS_MAP = {
 }
 
 
-def _flight_url(from_airport: str, to_airport: str, date: str, max_stops: str = "any") -> str:
-    """Build a Google Flights search URL for a one-way flight."""
-    # Airport messages: message Airport { string airport = 2; }
+def _flight_data(from_airport: str, to_airport: str, date: str, max_stops: str = "any") -> bytes:
     from_ap = _pb_string(2, from_airport)
     to_ap = _pb_string(2, to_airport)
 
-    # FlightData: date=2, max_stops=5, from_flight=13, to_flight=14
     flight_data = _pb_string(2, date)
     stops_val = _URL_STOPS_MAP.get(max_stops)
     if stops_val is not None:
         flight_data += _pb_enum(5, stops_val)
     flight_data += _pb_message(13, from_ap)
     flight_data += _pb_message(14, to_ap)
+    return flight_data
 
-    # Info: data=3, passengers=8, seat=9, trip=19
-    info = _pb_message(3, flight_data)
-    info += _pb_enum(8, 1)   # ADULT
-    info += _pb_enum(9, 1)   # ECONOMY
-    info += _pb_enum(19, 2)  # ONE_WAY
+
+def _flight_url(
+    from_airport: str,
+    to_airport: str,
+    outbound_date: str,
+    max_stops: str = "any",
+    return_date: str | None = None,
+) -> str:
+    """Build a Google Flights search URL for a one-way or round-trip flight."""
+    outbound = _flight_data(from_airport, to_airport, outbound_date, max_stops=max_stops)
+
+    if return_date:
+        inbound = _flight_data(to_airport, from_airport, return_date, max_stops=max_stops)
+        info = _pb_message(3, outbound) + _pb_message(3, inbound)
+        info += _pb_enum(8, 1)   # ADULT
+        info += _pb_enum(9, 1)   # ECONOMY
+        info += _pb_enum(19, 1)  # ROUND_TRIP
+    else:
+        info = _pb_message(3, outbound)
+        info += _pb_enum(8, 1)   # ADULT
+        info += _pb_enum(9, 1)   # ECONOMY
+        info += _pb_enum(19, 2)  # ONE_WAY
 
     tfs = base64.urlsafe_b64encode(info).decode("ascii").rstrip("=")
     return f"https://www.google.com/travel/flights/search?tfs={tfs}"
 
 
 def format_daily_message(result: ScanResult, prev_cheapest: float | None = None, stops_label: str | None = None, max_stops: str = "any") -> str:
-    header = f"✈️ {result.from_airport} → {result.to_airport} | Next 30 Days"
+    is_roundtrip = result.stay_days is not None
+    route_label = f"{result.from_airport} ⇄ {result.to_airport}" if is_roundtrip else f"{result.from_airport} → {result.to_airport}"
+    header = f"✈️ {route_label} | Next 30 Days"
+    if is_roundtrip:
+        header += f" | {result.stay_days}-day stay"
     if stops_label:
         header += f" | Filter: {stops_label}"
     lines = [
@@ -97,8 +124,8 @@ def format_daily_message(result: ScanResult, prev_cheapest: float | None = None,
         "",
     ]
 
-    # Cheapest day header
-    cheapest_line = f"🏆 Cheapest: {_format_date(result.cheapest_travel_date)} - {_format_price(result.cheapest_price)}"
+    cheapest_dates = _format_trip_dates(result.cheapest_travel_date, result.cheapest_return_date)
+    cheapest_line = f"🏆 Cheapest: {cheapest_dates} - {_format_price(result.cheapest_price)}"
     lines.append(cheapest_line)
 
     if result.cheapest_airline:
@@ -113,22 +140,26 @@ def format_daily_message(result: ScanResult, prev_cheapest: float | None = None,
 
     lines.append("")
 
-    # Top cheapest days
     lines.append(f"📊 Top {len(result.top_days)} Cheapest Days:")
     for i, day in enumerate(result.top_days, 1):
-        url = _flight_url(result.from_airport, result.to_airport, day["date"], max_stops=max_stops)
-        lines.append(f" {i}. {_format_date(day['date'])} - {_format_price(day['price'])}  [Book →]({url})")
+        url = _flight_url(
+            result.from_airport,
+            result.to_airport,
+            day["date"],
+            max_stops=max_stops,
+            return_date=day.get("return_date"),
+        )
+        day_label = _format_trip_dates(day["date"], day.get("return_date"))
+        lines.append(f" {i}. {day_label} - {_format_price(day['price'])}  [Book →]({url})")
 
     lines.append("")
 
-    # Stats
     lines.append(
         f"📈 Avg: {_format_price(result.avg_price)} | "
         f"Low: {_format_price(result.min_price)} | "
         f"High: {_format_price(result.max_price)}"
     )
 
-    # Trend
     if prev_cheapest is not None:
         pct = ((result.cheapest_price - prev_cheapest) / prev_cheapest) * 100
         if pct < 0:
@@ -141,11 +172,16 @@ def format_daily_message(result: ScanResult, prev_cheapest: float | None = None,
     return "\n".join(lines)
 
 
-def format_history_message(from_airport: str, to_airport: str, history: list[dict]) -> str:
+def format_history_message(
+    from_airport: str,
+    to_airport: str,
+    history: list[dict],
+    stay_days: int | None = None,
+) -> str:
     if not history:
-        return f"📉 {from_airport} → {to_airport} | No history yet"
+        route_label = f"{from_airport} ⇄ {to_airport}" if stay_days else f"{from_airport} → {to_airport}"
+        return f"📉 {route_label} | No history yet"
 
-    # History comes DESC from DB, reverse for display
     history = list(reversed(history))
 
     prices = [h["cheapest_price"] for h in history]
@@ -153,8 +189,9 @@ def format_history_message(from_airport: str, to_airport: str, history: list[dic
     max_price = max(prices)
     price_range = max_price - min_price if max_price != min_price else 1
 
+    route_label = f"{from_airport} ⇄ {to_airport}" if stay_days else f"{from_airport} → {to_airport}"
     lines = [
-        f"📉 {from_airport} → {to_airport} | {len(history)}-Day Price Trend",
+        f"📉 {route_label} | {len(history)}-Day Price Trend",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
@@ -170,16 +207,18 @@ def format_history_message(from_airport: str, to_airport: str, history: list[dic
 
     lines.append("")
 
-    # Trend
     if len(prices) >= 2:
         pct = ((prices[-1] - prices[0]) / prices[0]) * 100
         direction = "Down" if pct < 0 else "Up"
         lines.append(f"📉 Trend: {direction} {abs(pct):.0f}% this week")
 
-    # Best day found in latest scan
     latest = history[-1]
+    best_dates = _format_trip_dates(
+        latest.get("cheapest_travel_date", latest["scan_date"]),
+        latest.get("cheapest_return_date"),
+    )
     lines.append(
-        f"💡 Best day to fly found today: {_format_date(latest.get('cheapest_travel_date', latest['scan_date']))} @ {_format_price(latest['cheapest_price'])}"
+        f"💡 Best day to fly found today: {best_dates} @ {_format_price(latest['cheapest_price'])}"
     )
 
     return "\n".join(lines)

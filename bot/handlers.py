@@ -5,7 +5,7 @@ from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from bot.config import CHAT_ID, INTERVAL_OPTIONS
+from bot.config import CHAT_ID, INTERVAL_OPTIONS, MAX_STAY_DAYS, MIN_STAY_DAYS
 from bot.db import Database
 from bot.scanner import scan_route, NO_MATCHES
 from bot.formatter import (
@@ -58,7 +58,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✈️ SastaFlight - Flight Price Scanner\n\n"
         "Commands:\n"
-        "/add <from> <to> - Add a route (e.g. /add ATQ BOM)\n"
+        "/add <from> <to> [days] - Add a route (e.g. /add VIX MXP 10)\n"
         "/remove <id> - Remove a route\n"
         "/routes - List active routes\n"
         "/stops - Set default stops preference\n"
@@ -81,8 +81,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return
-    if not context.args or len(context.args) != 2:
-        await update.message.reply_text("Usage: /add <from> <to>\nExample: /add ATQ BOM")
+    if not context.args or len(context.args) not in (2, 3):
+        await update.message.reply_text(
+            "Usage: /add <from> <to> [days]\n"
+            "Examples:\n"
+            "/add ATQ BOM — one-way\n"
+            "/add VIX MXP 10 — round-trip, 10-day stay"
+        )
         return
 
     from_code = context.args[0].upper()
@@ -92,13 +97,30 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Airport codes must be 3 letters (IATA codes).")
         return
 
-    route_id = await db.add_route(from_code, to_code)
+    stay_days = None
+    if len(context.args) == 3:
+        try:
+            stay_days = int(context.args[2])
+        except ValueError:
+            await update.message.reply_text("Stay days must be a whole number.")
+            return
+        if stay_days < MIN_STAY_DAYS or stay_days > MAX_STAY_DAYS:
+            await update.message.reply_text(
+                f"Stay days must be between {MIN_STAY_DAYS} and {MAX_STAY_DAYS}."
+            )
+            return
+
+    route_id = await db.add_route(from_code, to_code, stay_days=stay_days)
     # Schedule a scan job for the new route
     from bot.main import schedule_scan_jobs
     await schedule_scan_jobs(context.application)
     keyboard = _stops_keyboard(f"stops_newroute:{route_id}")
+    if stay_days:
+        route_label = f"{from_code} ⇄ {to_code} ({stay_days} days)"
+    else:
+        route_label = f"{from_code} → {to_code}"
     await update.message.reply_text(
-        f"✅ Route added: {from_code} → {to_code} (ID: {route_id})\n"
+        f"✅ Route added: {route_label} (ID: {route_id})\n"
         "Select stops preference for this route:",
         reply_markup=keyboard,
     )
@@ -145,7 +167,12 @@ async def routes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stops_label = STOPS_LABELS.get(effective_stops, effective_stops)
         effective_interval = r["scan_interval"] or global_interval
         freq_label = INTERVAL_LABELS.get(effective_interval, f"{effective_interval}m")
-        lines.append(f"  {r['id']}. {r['from_airport']} → {r['to_airport']} | {stops_label} | Every {freq_label}")
+        stay_days = r.get("stay_days")
+        if stay_days:
+            route_label = f"{r['from_airport']} ⇄ {r['to_airport']} ({stay_days}d)"
+        else:
+            route_label = f"{r['from_airport']} → {r['to_airport']}"
+        lines.append(f"  {r['id']}. {route_label} | {stops_label} | Every {freq_label}")
         keyboard_rows.append([
             InlineKeyboardButton(
                 f"Change Stops: {r['from_airport']} → {r['to_airport']}",
@@ -213,7 +240,12 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for route in routes:
         history = await db.get_price_history(route["id"], days=7)
-        msg = format_history_message(route["from_airport"], route["to_airport"], history)
+        msg = format_history_message(
+            route["from_airport"],
+            route["to_airport"],
+            history,
+            stay_days=route.get("stay_days"),
+        )
         await update.message.reply_text(msg)
 
 
@@ -386,12 +418,15 @@ async def _scan_and_send(context: ContextTypes.DEFAULT_TYPE, route: dict, is_ret
     # Resolve stops preference
     max_stops = await db.get_route_stops_preference(route["id"])
 
-    result = await scan_route(from_code, to_code, max_stops=max_stops)
+    stay_days = route.get("stay_days")
+
+    result = await scan_route(from_code, to_code, max_stops=max_stops, stay_days=stay_days)
 
     if result is NO_MATCHES:
         stops_label = STOPS_LABELS.get(max_stops, max_stops)
+        route_label = f"{from_code} ⇄ {to_code}" if stay_days else f"{from_code} → {to_code}"
         msg = (
-            f"✈️ {from_code} → {to_code}\n"
+            f"✈️ {route_label}\n"
             f"No flights found matching filter: {stops_label}\n"
             "Try a less restrictive stops preference via /stops or /routes."
         )
@@ -433,6 +468,7 @@ async def _scan_and_send(context: ContextTypes.DEFAULT_TYPE, route: dict, is_ret
         route_id=route["id"],
         scan_date=today,
         cheapest_travel_date=result.cheapest_travel_date,
+        cheapest_return_date=result.cheapest_return_date,
         cheapest_price=result.cheapest_price,
         cheapest_airline=result.cheapest_airline,
         avg_price=result.avg_price,

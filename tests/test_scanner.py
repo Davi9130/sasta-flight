@@ -1,28 +1,42 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from datetime import datetime
+from datetime import datetime, timedelta
 from bot.scanner import scan_route_dates, scan_flight_details, ScanResult
 
 
 @pytest.fixture
-def mock_date_results():
+def future_outbound_dates():
+    base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=3)
+    return [base + timedelta(days=i) for i in range(7)]
+
+
+@pytest.fixture
+def mock_date_results(future_outbound_dates):
     """Simulate fli SearchDates response."""
     results = []
-    for i, price in enumerate([5000, 3200, 4500, 3800, 6000, 3500, 4200], start=1):
+    for date, price in zip(
+        future_outbound_dates,
+        [5000, 3200, 4500, 3800, 6000, 3500, 4200],
+    ):
         mock = MagicMock()
-        mock.date = [datetime(2026, 4, i)]
+        mock.date = [date]
         mock.price = price
         results.append(mock)
     return results
 
 
 @pytest.fixture
-def mock_flight_results():
+def cheapest_outbound_date(future_outbound_dates):
+    return future_outbound_dates[1]
+
+
+@pytest.fixture
+def mock_flight_results(cheapest_outbound_date):
     """Simulate fli SearchFlights response."""
     leg = MagicMock()
     leg.airline.value = "IndiGo"
-    leg.departure_datetime = datetime(2026, 4, 2, 6, 0)
-    leg.arrival_datetime = datetime(2026, 4, 2, 8, 45)
+    leg.departure_datetime = cheapest_outbound_date.replace(hour=6, minute=0)
+    leg.arrival_datetime = cheapest_outbound_date.replace(hour=8, minute=45)
     leg.departure_airport.value = "ATQ"
     leg.arrival_airport.value = "BOM"
 
@@ -35,21 +49,82 @@ def mock_flight_results():
 
 
 @pytest.mark.asyncio
-async def test_scan_route_dates(mock_date_results):
+async def test_scan_route_dates_roundtrip(mock_date_results, cheapest_outbound_date):
+    for mock in mock_date_results:
+        outbound = mock.date[0]
+        mock.date = (outbound, outbound + timedelta(days=10))
+
+    with patch("bot.scanner.SearchDates") as MockSearch:
+        MockSearch.return_value.search.return_value = mock_date_results
+        result = await scan_route_dates("VIX", "MXP", days=7, stay_days=10)
+
+    assert len(result) == 7
+    assert result[0]["return_date"] == (cheapest_outbound_date + timedelta(days=10)).strftime("%Y-%m-%d")
+    assert "price" in result[0]
+
+    call_args = MockSearch.return_value.search.call_args[0][0]
+    from fli.models import TripType
+    assert call_args.trip_type == TripType.ROUND_TRIP
+    assert len(call_args.flight_segments) == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_flight_details_roundtrip(mock_flight_results, cheapest_outbound_date):
+    outbound = cheapest_outbound_date.strftime("%Y-%m-%d")
+    return_date = (cheapest_outbound_date + timedelta(days=10)).strftime("%Y-%m-%d")
+    rt_result = (mock_flight_results[0], mock_flight_results[0])
+    with patch("bot.scanner.SearchFlights") as MockSearch:
+        MockSearch.return_value.search.return_value = [rt_result]
+        result = await scan_flight_details(
+            "VIX", "MXP", outbound, return_date=return_date, max_stops="direct"
+        )
+
+    assert result["price"] == 3200
+    call_args = MockSearch.return_value.search.call_args[0][0]
+    from fli.models import TripType
+    assert call_args.trip_type == TripType.ROUND_TRIP
+    assert len(call_args.flight_segments) == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_route_roundtrip(mock_date_results, mock_flight_results, cheapest_outbound_date):
+    for mock in mock_date_results:
+        outbound = mock.date[0]
+        mock.date = (outbound, outbound + timedelta(days=10))
+
+    rt_result = (mock_flight_results[0], mock_flight_results[0])
+    expected_return = (cheapest_outbound_date + timedelta(days=10)).strftime("%Y-%m-%d")
+    with patch("bot.scanner.SearchDates") as MockDates, \
+         patch("bot.scanner.SearchFlights") as MockFlights:
+        MockDates.return_value.search.return_value = mock_date_results
+        MockFlights.return_value.search.return_value = [rt_result]
+
+        result = await scan_route("VIX", "MXP", stay_days=10)
+
+    assert result is not None
+    assert result.stay_days == 10
+    assert result.cheapest_return_date == expected_return
+    assert len(result.top_days) == 5
+    assert result.top_days[0]["return_date"] == expected_return
+
+
+@pytest.mark.asyncio
+async def test_scan_route_dates(mock_date_results, cheapest_outbound_date):
     with patch("bot.scanner.SearchDates") as MockSearch:
         MockSearch.return_value.search.return_value = mock_date_results
         result = await scan_route_dates("ATQ", "BOM", days=7)
 
     assert len(result) == 7
-    assert result[0]["price"] == 3200  # sorted cheapest first
-    assert result[0]["date"] == "2026-04-02"
+    assert result[0]["price"] == 3200
+    assert result[0]["date"] == cheapest_outbound_date.strftime("%Y-%m-%d")
 
 
 @pytest.mark.asyncio
-async def test_scan_flight_details(mock_flight_results):
+async def test_scan_flight_details(mock_flight_results, cheapest_outbound_date):
+    travel_date = cheapest_outbound_date.strftime("%Y-%m-%d")
     with patch("bot.scanner.SearchFlights") as MockSearch:
         MockSearch.return_value.search.return_value = mock_flight_results
-        result = await scan_flight_details("ATQ", "BOM", "2026-04-02")
+        result = await scan_flight_details("ATQ", "BOM", travel_date)
 
     assert result["price"] == 3200
     assert result["airline"] == "IndiGo"
@@ -85,56 +160,57 @@ from fli.models import MaxStops
 
 
 @pytest.mark.asyncio
-async def test_scan_flight_details_with_max_stops(mock_flight_results):
+async def test_scan_flight_details_with_max_stops(mock_flight_results, cheapest_outbound_date):
+    travel_date = cheapest_outbound_date.strftime("%Y-%m-%d")
     with patch("bot.scanner.SearchFlights") as MockSearch:
         MockSearch.return_value.search.return_value = mock_flight_results
-        result = await scan_flight_details("ATQ", "BOM", "2026-04-02", max_stops="direct")
+        result = await scan_flight_details("ATQ", "BOM", travel_date, max_stops="direct")
 
-    # Verify MaxStops was passed to filters
     call_args = MockSearch.return_value.search.call_args[0][0]
     assert call_args.stops == MaxStops.NON_STOP
 
 
 @pytest.mark.asyncio
-async def test_scan_flight_details_default_max_stops(mock_flight_results):
+async def test_scan_flight_details_default_max_stops(mock_flight_results, cheapest_outbound_date):
+    travel_date = cheapest_outbound_date.strftime("%Y-%m-%d")
     with patch("bot.scanner.SearchFlights") as MockSearch:
         MockSearch.return_value.search.return_value = mock_flight_results
-        result = await scan_flight_details("ATQ", "BOM", "2026-04-02")
+        result = await scan_flight_details("ATQ", "BOM", travel_date)
 
     call_args = MockSearch.return_value.search.call_args[0][0]
     assert call_args.stops == MaxStops.ANY
 
 
 @pytest.mark.asyncio
-async def test_scan_route_skips_dates_without_matching_flights(mock_date_results):
+async def test_scan_route_skips_dates_without_matching_flights(
+    mock_date_results, future_outbound_dates
+):
     """When stops filter causes some dates to have no flights, skip them."""
     with patch("bot.scanner.SearchDates") as MockDates, \
          patch("bot.scanner.SearchFlights") as MockFlights:
         MockDates.return_value.search.return_value = mock_date_results
-        # First 2 dates return no flights, 3rd returns a flight
         leg = MagicMock()
         leg.airline.value = "IndiGo"
-        leg.departure_datetime = datetime(2026, 4, 5, 6, 0)
+        leg.departure_datetime = future_outbound_dates[2].replace(hour=6, minute=0)
         valid_flight = MagicMock()
         valid_flight.price = 4500
         valid_flight.duration = 165
         valid_flight.stops = 0
         valid_flight.legs = [leg]
         MockFlights.return_value.search.side_effect = [
-            [],  # date 1: no matching flights
-            [],  # date 2: no matching flights
-            [valid_flight],  # date 3: match
-            [valid_flight],  # date 4: match
-            [valid_flight],  # date 5: match
-            [valid_flight],  # date 6: match
-            [valid_flight],  # date 7: match
+            [],
+            [],
+            [valid_flight],
+            [valid_flight],
+            [valid_flight],
+            [valid_flight],
+            [valid_flight],
         ]
 
         result = await scan_route("ATQ", "BOM", max_stops="direct")
 
     assert result is not None
-    assert len(result.top_days) == 5  # still gets 5 valid days
+    assert len(result.top_days) == 5
 
 
-# Import scan_route here to avoid import issues at top
 from bot.scanner import scan_route

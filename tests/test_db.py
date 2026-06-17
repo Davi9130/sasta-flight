@@ -75,6 +75,31 @@ async def test_save_and_get_price_history(db):
 
 
 @pytest.mark.asyncio
+async def test_add_route_with_stay_days(db):
+    route_id = await db.add_route("VIX", "MXP", stay_days=10)
+    routes = await db.get_active_routes()
+    assert routes[0]["stay_days"] == 10
+    assert routes[0]["id"] == route_id
+
+
+@pytest.mark.asyncio
+async def test_save_price_history_with_return_date(db):
+    route_id = await db.add_route("VIX", "MXP", stay_days=10)
+    await db.save_price_history(
+        route_id=route_id,
+        scan_date="2026-03-07",
+        cheapest_travel_date="2026-03-18",
+        cheapest_return_date="2026-03-28",
+        cheapest_price=4500.0,
+        cheapest_airline="TAP",
+        avg_price=5100.0,
+        price_data=None,
+    )
+    history = await db.get_price_history(route_id, days=7)
+    assert history[0]["cheapest_return_date"] == "2026-03-28"
+
+
+@pytest.mark.asyncio
 async def test_init_creates_stops_preference(db):
     config = await db.get_config("stops_preference")
     assert config == "any"

@@ -68,8 +68,8 @@ python -m bot.main
 Once the bot is running, message it on Telegram:
 
 ```
-/add ATQ BOM          Add a route (Amritsar → Mumbai)
-/add DEL BLR          Add another route (Delhi → Bangalore)
+/add ATQ BOM          Add a one-way route (Amritsar → Mumbai)
+/add VIX MXP 10       Add round-trip with 10-day stay (Vitória → Milan)
 /check                Scan all routes right now
 /routes               List your saved routes
 /remove 1             Remove route by ID
@@ -82,23 +82,41 @@ Once the bot is running, message it on Telegram:
 
 ## Daily Message Example
 
+One-way:
+
 ```
 ✈️ ATQ → BOM | Next 30 Days
 ━━━━━━━━━━━━━━━━━━━━━━
 
-🏆 Cheapest: Mar 18 (Tue) - ₹3,200
+🏆 Cheapest: Mar 18 (Tue) - R$3,200
    IndiGo | 06:00 AM | 2h 45m | Nonstop
 
 📊 Top 5 Cheapest Days:
- 1. Mar 18 (Tue) - ₹3,200
- 2. Mar 20 (Thu) - ₹3,450
- 3. Mar 25 (Tue) - ₹3,500
- 4. Mar 12 (Wed) - ₹3,800
- 5. Mar 15 (Sat) - ₹4,100
+ 1. Mar 18 (Tue) - R$3,200
+ 2. Mar 20 (Thu) - R$3,450
+ 3. Mar 25 (Tue) - R$3,500
+ 4. Mar 12 (Wed) - R$3,800
+ 5. Mar 15 (Sat) - R$4,100
 
-📈 Avg: ₹5,200 | Low: ₹3,200 | High: ₹8,900
+📈 Avg: R$5,200 | Low: R$3,200 | High: R$8,900
 
 💡 Trend: Prices dropped 8% since yesterday
+```
+
+Round-trip (`/add VIX MXP 10`):
+
+```
+✈️ VIX ⇄ MXP | Next 30 Days | 10-day stay
+━━━━━━━━━━━━━━━━━━━━━━
+
+🏆 Cheapest: Mar 18 (Tue) → Mar 28 (Fri) - R$4,500
+   TAP | 08:30 PM | 12h 15m | 1 stop
+
+📊 Top 5 Cheapest Days:
+ 1. Mar 18 (Tue) → Mar 28 (Fri) - R$4,500  [Book →]
+ 2. Mar 20 (Thu) → Mar 30 (Sat) - R$4,720  [Book →]
+
+📈 Avg: R$5,100 | Low: R$4,500 | High: R$6,200
 ```
 
 ## Environment Variables
@@ -110,6 +128,7 @@ Once the bot is running, message it on Telegram:
 | `DAYS_TO_SCAN` | No | `30` | Number of days ahead to scan |
 | `TOP_CHEAPEST` | No | `5` | How many cheapest days to show |
 | `TIMEZONE` | No | `Asia/Kolkata` | Timezone for scheduling |
+| `CURRENCY` | No | `BRL` | Price currency (`BRL`, `USD`, `EUR`, `GBP`) |
 | `DB_PATH` | No | `data/flights.db` | SQLite database path |
 
 ## How It Works

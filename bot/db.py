@@ -67,6 +67,22 @@ class Database:
         except Exception:
             pass  # Column already exists
 
+        # Migrate: add stay_days column if missing
+        try:
+            await self.db.execute("ALTER TABLE routes ADD COLUMN stay_days INTEGER DEFAULT NULL")
+            await self.db.commit()
+        except Exception:
+            pass  # Column already exists
+
+        # Migrate: add cheapest_return_date column if missing
+        try:
+            await self.db.execute(
+                "ALTER TABLE price_history ADD COLUMN cheapest_return_date TEXT DEFAULT NULL"
+            )
+            await self.db.commit()
+        except Exception:
+            pass  # Column already exists
+
     async def close(self):
         if self.db:
             await self.db.close()
@@ -85,17 +101,24 @@ class Database:
         )
         await self.db.commit()
 
-    async def add_route(self, from_airport: str, to_airport: str, max_stops: str | None = None) -> int:
+    async def add_route(
+        self,
+        from_airport: str,
+        to_airport: str,
+        max_stops: str | None = None,
+        stay_days: int | None = None,
+    ) -> int:
         cursor = await self.db.execute(
-            "INSERT INTO routes (from_airport, to_airport, max_stops) VALUES (?, ?, ?)",
-            (from_airport.upper(), to_airport.upper(), max_stops),
+            "INSERT INTO routes (from_airport, to_airport, max_stops, stay_days) VALUES (?, ?, ?, ?)",
+            (from_airport.upper(), to_airport.upper(), max_stops, stay_days),
         )
         await self.db.commit()
         return cursor.lastrowid
 
     async def get_active_routes(self) -> list[dict]:
         cursor = await self.db.execute(
-            "SELECT id, from_airport, to_airport, max_stops, scan_interval FROM routes WHERE is_active = 1"
+            """SELECT id, from_airport, to_airport, max_stops, scan_interval, stay_days
+            FROM routes WHERE is_active = 1"""
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -156,18 +179,30 @@ class Database:
         cheapest_airline: str | None,
         avg_price: float | None,
         price_data: str | None,
+        cheapest_return_date: str | None = None,
     ):
         await self.db.execute(
             """INSERT OR REPLACE INTO price_history
-            (route_id, scan_date, cheapest_travel_date, cheapest_price, cheapest_airline, avg_price, price_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (route_id, scan_date, cheapest_travel_date, cheapest_price, cheapest_airline, avg_price, price_data),
+            (route_id, scan_date, cheapest_travel_date, cheapest_return_date,
+             cheapest_price, cheapest_airline, avg_price, price_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                route_id,
+                scan_date,
+                cheapest_travel_date,
+                cheapest_return_date,
+                cheapest_price,
+                cheapest_airline,
+                avg_price,
+                price_data,
+            ),
         )
         await self.db.commit()
 
     async def get_price_history(self, route_id: int, days: int = 7) -> list[dict]:
         cursor = await self.db.execute(
-            """SELECT scan_date, cheapest_travel_date, cheapest_price, cheapest_airline, avg_price, price_data
+            """SELECT scan_date, cheapest_travel_date, cheapest_return_date,
+                      cheapest_price, cheapest_airline, avg_price, price_data
             FROM price_history
             WHERE route_id = ?
             ORDER BY scan_date DESC
