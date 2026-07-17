@@ -1,24 +1,40 @@
 import json
 import logging
+import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from bot.config import CHAT_ID, INTERVAL_OPTIONS, MAX_STAY_DAYS, MIN_STAY_DAYS
+from bot.alerts import evaluate_alerts
+from bot.config import (
+    ALWAYS_SEND_SCAN_SUMMARY,
+    CHAT_ID,
+    COUNTRY,
+    CURRENCY,
+    DEFAULT_ALERT_COOLDOWN_MINUTES,
+    DEFAULT_ALERT_DROP_PCT,
+    INTERVAL_OPTIONS,
+    MAX_STAY_DAYS,
+    MIN_STAY_DAYS,
+    TIMEZONE,
+)
 from bot.db import Database
-from bot.scanner import scan_route, NO_MATCHES
 from bot.formatter import (
+    format_alert_only_message,
     format_daily_message,
     format_error_message,
     format_history_message,
     format_retry_failed_message,
 )
+from bot.fx import FxService
+from bot.scanner import NO_MATCHES, parse_airport_list, parse_stay_range, scan_route
 
 logger = logging.getLogger(__name__)
 
-# Global db reference, set in main.py
 db: Database = None
+fx_service: FxService | None = None
 
 STOPS_LABELS = {
     "any": "Any",
@@ -27,11 +43,10 @@ STOPS_LABELS = {
     "2stops": "Up to 2 Stops",
 }
 
-INTERVAL_LABELS = {str(v): k for k, v in INTERVAL_OPTIONS.items()}  # {"60": "1h", ...}
+INTERVAL_LABELS = {str(v): k for k, v in INTERVAL_OPTIONS.items()}
 
 
 def _frequency_keyboard(callback_prefix: str, current_minutes: str | None = None) -> InlineKeyboardMarkup:
-    """Build inline keyboard for frequency selection."""
     buttons = []
     for label, minutes in INTERVAL_OPTIONS.items():
         display = f">> {label} <<" if str(minutes) == current_minutes else label
@@ -40,7 +55,6 @@ def _frequency_keyboard(callback_prefix: str, current_minutes: str | None = None
 
 
 def _stops_keyboard(callback_prefix: str, current: str | None = None) -> InlineKeyboardMarkup:
-    """Build inline keyboard for stops selection."""
     buttons = []
     for value, label in STOPS_LABELS.items():
         display = f">> {label} <<" if value == current else label
@@ -52,24 +66,36 @@ def _is_authorized(update: Update) -> bool:
     return update.effective_chat.id == CHAT_ID
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_authorized(update):
-        return
-    await update.message.reply_text(
+def _help_text() -> str:
+    return (
         "✈️ SastaFlight - Flight Price Scanner\n\n"
         "Commands:\n"
-        "/add <from> <to> [days] - Add a route (e.g. /add VIX MXP 10)\n"
+        "/add <from> <to> [days|min-max] - Add a route\n"
+        "  Examples:\n"
+        "  /add VIX MXP — one-way\n"
+        "  /add VIX,GIG MXP,BGY 10 — multi-airport, 10-day stay\n"
+        "  /add VIX MXP 7-10 — flexible stay range\n"
         "/remove <id> - Remove a route\n"
         "/routes - List active routes\n"
         "/stops - Set default stops preference\n"
         "/frequency - Set scan frequency\n"
+        "/alert <id> target <price> - Alert when price ≤ target\n"
+        "/alert <id> drop <pct> - Alert on % drop vs last scan\n"
+        "/alert <id> clear - Clear target price\n"
         "/check - Scan all routes now\n"
-        "/time <HH:MM> - Set scan start time (24h, IST)\n"
-        "/history - 7-day price trend\n"
+        f"/time <HH:MM> - Set scan start time (24h, {TIMEZONE})\n"
+        "/history - Price trend + stats\n"
         "/pause - Pause scheduled scans\n"
         "/resume - Resume scheduled scans\n"
-        "/help - Show this message"
+        "/help - Show this message\n\n"
+        f"Prices shown in {CURRENCY} with ≈ EUR / USD when available."
     )
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    await update.message.reply_text(_help_text())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -78,45 +104,67 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_command(update, context)
 
 
+def _normalize_airport_arg(raw: str) -> str | None:
+    codes = parse_airport_list(raw)
+    if not codes:
+        return None
+    for code in codes:
+        if len(code) != 3 or not code.isalpha():
+            return None
+    return ",".join(codes)
+
+
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return
     if not context.args or len(context.args) not in (2, 3):
         await update.message.reply_text(
-            "Usage: /add <from> <to> [days]\n"
+            "Usage: /add <from> <to> [days|min-max]\n"
             "Examples:\n"
             "/add ATQ BOM — one-way\n"
-            "/add VIX MXP 10 — round-trip, 10-day stay"
+            "/add VIX MXP 10 — round-trip, 10-day stay\n"
+            "/add VIX,GIG MXP 7-10 — multi-origin, flexible stay"
         )
         return
 
-    from_code = context.args[0].upper()
-    to_code = context.args[1].upper()
-
-    if len(from_code) != 3 or len(to_code) != 3:
-        await update.message.reply_text("Airport codes must be 3 letters (IATA codes).")
+    from_code = _normalize_airport_arg(context.args[0])
+    to_code = _normalize_airport_arg(context.args[1])
+    if not from_code or not to_code:
+        await update.message.reply_text(
+            "Airport codes must be 3 letters (IATA). "
+            "Use commas for multiple: VIX,GIG"
+        )
         return
 
     stay_days = None
+    stay_days_max = None
     if len(context.args) == 3:
         try:
-            stay_days = int(context.args[2])
+            stay_days, stay_days_max = parse_stay_range(context.args[2])
         except ValueError:
-            await update.message.reply_text("Stay days must be a whole number.")
+            await update.message.reply_text("Stay days must be a number or range like 7-10.")
             return
-        if stay_days < MIN_STAY_DAYS or stay_days > MAX_STAY_DAYS:
+        if stay_days is None:
+            await update.message.reply_text("Stay days must be a number or range like 7-10.")
+            return
+        if stay_days < MIN_STAY_DAYS or (stay_days_max or stay_days) > MAX_STAY_DAYS:
             await update.message.reply_text(
                 f"Stay days must be between {MIN_STAY_DAYS} and {MAX_STAY_DAYS}."
             )
             return
 
-    route_id = await db.add_route(from_code, to_code, stay_days=stay_days)
-    # Schedule a scan job for the new route
+    route_id = await db.add_route(
+        from_code, to_code, stay_days=stay_days, stay_days_max=stay_days_max
+    )
     from bot.main import schedule_scan_jobs
+
     await schedule_scan_jobs(context.application)
     keyboard = _stops_keyboard(f"stops_newroute:{route_id}")
     if stay_days:
-        route_label = f"{from_code} ⇄ {to_code} ({stay_days} days)"
+        if stay_days_max and stay_days_max != stay_days:
+            route_label = f"{from_code} ⇄ {to_code} ({stay_days}-{stay_days_max} days)"
+        else:
+            route_label = f"{from_code} ⇄ {to_code} ({stay_days} days)"
     else:
         route_label = f"{from_code} → {to_code}"
     await update.message.reply_text(
@@ -141,13 +189,25 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     removed = await db.remove_route(route_id)
     if removed:
-        # Cancel the scheduled scan job for this route
         from bot.main import SCAN_JOB_PREFIX
+
         for job in context.job_queue.get_jobs_by_name(f"{SCAN_JOB_PREFIX}{route_id}"):
+            job.schedule_removal()
+        for job in context.job_queue.get_jobs_by_name(f"retry_{route_id}"):
             job.schedule_removal()
         await update.message.reply_text(f"✅ Route {route_id} removed.")
     else:
         await update.message.reply_text(f"❌ Route {route_id} not found.")
+
+
+def _route_label(route: dict) -> str:
+    stay_days = route.get("stay_days")
+    stay_max = route.get("stay_days_max")
+    if stay_days:
+        if stay_max and stay_max != stay_days:
+            return f"{route['from_airport']} ⇄ {route['to_airport']} ({stay_days}-{stay_max}d)"
+        return f"{route['from_airport']} ⇄ {route['to_airport']} ({stay_days}d)"
+    return f"{route['from_airport']} → {route['to_airport']}"
 
 
 async def routes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,27 +227,99 @@ async def routes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stops_label = STOPS_LABELS.get(effective_stops, effective_stops)
         effective_interval = r["scan_interval"] or global_interval
         freq_label = INTERVAL_LABELS.get(effective_interval, f"{effective_interval}m")
-        stay_days = r.get("stay_days")
-        if stay_days:
-            route_label = f"{r['from_airport']} ⇄ {r['to_airport']} ({stay_days}d)"
-        else:
-            route_label = f"{r['from_airport']} → {r['to_airport']}"
-        lines.append(f"  {r['id']}. {route_label} | {stops_label} | Every {freq_label}")
-        keyboard_rows.append([
-            InlineKeyboardButton(
-                f"Change Stops: {r['from_airport']} → {r['to_airport']}",
-                callback_data=f"stops_pick:{r['id']}",
-            )
-        ])
-        keyboard_rows.append([
-            InlineKeyboardButton(
-                f"Change Frequency: {r['from_airport']} → {r['to_airport']}",
-                callback_data=f"freq_pick:{r['id']}",
-            )
-        ])
+        alert_bits = []
+        if r.get("target_price") is not None:
+            alert_bits.append(f"target≤{r['target_price']:g}")
+        drop = r.get("alert_drop_pct")
+        if drop is not None:
+            alert_bits.append(f"drop≥{drop:g}%")
+        alert_txt = f" | alerts: {', '.join(alert_bits)}" if alert_bits else ""
+        lines.append(
+            f"  {r['id']}. {_route_label(r)} | {stops_label} | Every {freq_label}{alert_txt}"
+        )
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"Change Stops: {r['from_airport']} → {r['to_airport']}",
+                    callback_data=f"stops_pick:{r['id']}",
+                )
+            ]
+        )
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"Change Frequency: {r['from_airport']} → {r['to_airport']}",
+                    callback_data=f"freq_pick:{r['id']}",
+                )
+            ]
+        )
 
     markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
     await update.message.reply_text("\n".join(lines), reply_markup=markup)
+
+
+async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/alert <id> target <price>\n"
+            "/alert <id> drop <pct>\n"
+            "/alert <id> clear\n"
+            f"Defaults: drop {DEFAULT_ALERT_DROP_PCT:g}%, "
+            f"cooldown {DEFAULT_ALERT_COOLDOWN_MINUTES}m"
+        )
+        return
+
+    try:
+        route_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Route ID must be a number.")
+        return
+
+    action = context.args[1].lower()
+    route = await db.get_route(route_id)
+    if not route or not route.get("is_active", 1):
+        await update.message.reply_text(f"❌ Route {route_id} not found.")
+        return
+
+    if action == "clear":
+        await db.clear_route_target_price(route_id)
+        await update.message.reply_text(f"✅ Cleared target price for route {route_id}.")
+        return
+
+    if action == "target":
+        if len(context.args) != 3:
+            await update.message.reply_text("Usage: /alert <id> target <price>")
+            return
+        try:
+            price = float(context.args[2])
+        except ValueError:
+            await update.message.reply_text("Price must be a number.")
+            return
+        await db.set_route_alert(route_id, target_price=price)
+        await update.message.reply_text(
+            f"✅ Route {route_id} will alert when price ≤ {price:g} {CURRENCY}."
+        )
+        return
+
+    if action == "drop":
+        if len(context.args) != 3:
+            await update.message.reply_text("Usage: /alert <id> drop <pct>")
+            return
+        try:
+            pct = float(context.args[2])
+        except ValueError:
+            await update.message.reply_text("Percent must be a number.")
+            return
+        await db.set_route_alert(route_id, alert_drop_pct=pct)
+        await update.message.reply_text(
+            f"✅ Route {route_id} will alert on drops ≥ {pct:g}%."
+        )
+        return
+
+    await update.message.reply_text("Unknown alert action. Use target, drop, or clear.")
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,7 +333,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Scanning... this may take a moment.")
 
     for route in routes:
-        await _scan_and_send(context, route)
+        await _scan_and_send(context, route, use_lock=True)
 
 
 async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,7 +342,7 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) != 1:
         current = await db.get_config("notify_time")
         await update.message.reply_text(
-            f"Current scan start time: {current} IST\nUsage: /time <HH:MM>"
+            f"Current scan start time: {current} ({TIMEZONE})\nUsage: /time <HH:MM>"
         )
         return
 
@@ -222,12 +354,10 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await db.set_config("notify_time", time_str)
-
-    # Reschedule - import here to avoid circular
     from bot.main import schedule_scan_jobs
-    await schedule_scan_jobs(context.application)
 
-    await update.message.reply_text(f"✅ Scan start time set to {time_str} IST")
+    await schedule_scan_jobs(context.application)
+    await update.message.reply_text(f"✅ Scan start time set to {time_str} ({TIMEZONE})")
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,12 +369,23 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for route in routes:
-        history = await db.get_price_history(route["id"], days=7)
+        history = await db.get_price_history(route["id"], days=14)
+        stats = await db.get_route_price_stats(route["id"], days=30)
+        fx_amounts = None
+        if stats.get("latest") is not None and fx_service:
+            try:
+                fx_amounts = await fx_service.convert(stats["latest"], base=CURRENCY)
+            except Exception:
+                logger.exception("FX convert failed for history")
         msg = format_history_message(
             route["from_airport"],
             route["to_airport"],
             history,
             stay_days=route.get("stay_days"),
+            stay_days_max=route.get("stay_days_max"),
+            stats=stats,
+            fx_amounts=fx_amounts,
+            currency=CURRENCY,
         )
         await update.message.reply_text(msg)
 
@@ -289,7 +430,6 @@ async def frequency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stops_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard callbacks for stops preference."""
     if not _is_authorized(update):
         return
     query = update.callback_query
@@ -351,7 +491,6 @@ async def stops_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard callbacks for frequency."""
     if not _is_authorized(update):
         return
     query = update.callback_query
@@ -363,10 +502,9 @@ async def frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if value not in INTERVAL_LABELS:
             return
         await db.set_config("scan_interval", value)
-
         from bot.main import schedule_scan_jobs
-        await schedule_scan_jobs(context.application)
 
+        await schedule_scan_jobs(context.application)
         label = INTERVAL_LABELS[value]
         await query.edit_message_text(f"✅ Scan frequency set to every {label} for all routes.")
 
@@ -395,10 +533,9 @@ async def frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if value not in INTERVAL_LABELS:
             return
         await db.set_route_scan_interval(route_id, value)
-
         from bot.main import schedule_scan_jobs
-        await schedule_scan_jobs(context.application)
 
+        await schedule_scan_jobs(context.application)
         routes = await db.get_active_routes()
         route = next((r for r in routes if r["id"] == route_id), None)
         label = INTERVAL_LABELS[value]
@@ -410,86 +547,221 @@ async def frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text(f"✅ Route scan frequency set to every {label}.")
 
 
-async def _scan_and_send(context: ContextTypes.DEFAULT_TYPE, route: dict, is_retry: bool = False):
-    """Scan a single route and send the result. Schedule retry on failure."""
+async def _should_send_summary() -> bool:
+    cfg = await db.get_config("always_send_summary")
+    if cfg is None:
+        return ALWAYS_SEND_SCAN_SUMMARY
+    return cfg != "0"
+
+
+async def _scan_and_send(
+    context: ContextTypes.DEFAULT_TYPE,
+    route: dict,
+    is_retry: bool = False,
+    use_lock: bool = False,
+):
+    """Scan a single route, persist history/alerts, and notify."""
     from_code = route["from_airport"]
     to_code = route["to_airport"]
 
-    # Resolve stops preference
-    max_stops = await db.get_route_stops_preference(route["id"])
+    if use_lock:
+        scanning = context.bot_data.setdefault("_scanning_routes", set())
+        if route["id"] in scanning:
+            return
+        scanning.add(route["id"])
 
-    stay_days = route.get("stay_days")
-    if stay_days is not None:
-        stay_days = int(stay_days)
+    started = time.monotonic()
+    try:
+        max_stops = await db.get_route_stops_preference(route["id"])
+        stay_days = route.get("stay_days")
+        stay_days_max = route.get("stay_days_max")
+        if stay_days is not None:
+            stay_days = int(stay_days)
+        if stay_days_max is not None:
+            stay_days_max = int(stay_days_max)
 
-    result = await scan_route(from_code, to_code, max_stops=max_stops, stay_days=stay_days)
+        # Previous cheapest BEFORE this run
+        prev_cheapest = await db.get_previous_cheapest(route["id"])
+        stats_before = await db.get_route_price_stats(route["id"], days=30)
 
-    if result is NO_MATCHES:
-        stops_label = STOPS_LABELS.get(max_stops, max_stops)
-        route_label = f"{from_code} ⇄ {to_code}" if stay_days else f"{from_code} → {to_code}"
-        msg = (
-            f"✈️ {route_label}\n"
-            f"No flights found matching filter: {stops_label}\n"
-            "Try a less restrictive stops preference via /stops or /routes."
+        result = await scan_route(
+            from_code,
+            to_code,
+            max_stops=max_stops,
+            stay_days=stay_days,
+            stay_days_max=stay_days_max,
+            currency=CURRENCY,
+            country=COUNTRY,
         )
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-        return
 
-    if result is None:
-        if is_retry:
-            msg = format_retry_failed_message(from_code, to_code, stay_days=stay_days)
+        duration_ms = int((time.monotonic() - started) * 1000)
+
+        if result is NO_MATCHES:
+            await db.create_scan_run(
+                route["id"],
+                "no_matches",
+                provider="fli",
+                currency=CURRENCY,
+                duration_ms=duration_ms,
+                filters_json=json.dumps({"max_stops": max_stops}),
+            )
+            stops_label = STOPS_LABELS.get(max_stops, max_stops)
+            msg = (
+                f"✈️ {_route_label(route)}\n"
+                f"No flights found matching filter: {stops_label}\n"
+                "Try a less restrictive stops preference via /stops or /routes."
+            )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-        else:
-            # Schedule retry only if interval > 4 hours
-            interval = await db.get_route_scan_interval(route["id"])
-            if interval > 240:
-                msg = format_error_message(from_code, to_code, stay_days=stay_days)
+            return
+
+        if result is None:
+            await db.create_scan_run(
+                route["id"],
+                "error",
+                provider="fli",
+                currency=CURRENCY,
+                duration_ms=duration_ms,
+                error="scan returned None",
+            )
+            if is_retry:
+                msg = format_retry_failed_message(from_code, to_code, stay_days=stay_days)
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-                context.job_queue.run_once(
-                    _retry_scan_job,
-                    when=4 * 60 * 60,
-                    data=route,
-                    name=f"retry_{route['id']}",
-                )
             else:
-                msg = (
-                    f"⚠️ {from_code} → {to_code}\n"
-                    "Scan failed. Will retry on next scheduled scan.\n"
-                    "Run /check to try manually."
-                )
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-        return
+                interval = await db.get_route_scan_interval(route["id"])
+                if interval > 240:
+                    msg = format_error_message(from_code, to_code, stay_days=stay_days)
+                    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+                    # Deduplicate retry jobs
+                    existing = context.job_queue.get_jobs_by_name(f"retry_{route['id']}")
+                    if not existing:
+                        context.job_queue.run_once(
+                            _retry_scan_job,
+                            when=4 * 60 * 60,
+                            data={"route_id": route["id"]},
+                            name=f"retry_{route['id']}",
+                        )
+                else:
+                    msg = (
+                        f"⚠️ {from_code} → {to_code}\n"
+                        "Scan failed. Will retry on next scheduled scan.\n"
+                        "Run /check to try manually."
+                    )
+                    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+            return
 
-    # Get previous cheapest for trend
-    history = await db.get_price_history(route["id"], days=1)
-    prev_cheapest = history[0]["cheapest_price"] if history else None
+        scan_run_id = await db.create_scan_run(
+            route["id"],
+            "ok",
+            provider=result.provider,
+            currency=result.currency,
+            duration_ms=duration_ms,
+            cheapest_price=result.cheapest_price,
+            cheapest_travel_date=result.cheapest_travel_date,
+            cheapest_return_date=result.cheapest_return_date,
+            fare_type=result.fare_type,
+            candidates_checked=result.candidates_checked,
+            filters_json=json.dumps(
+                {
+                    "max_stops": max_stops,
+                    "stay_days": stay_days,
+                    "stay_days_max": stay_days_max,
+                }
+            ),
+        )
 
-    # Save to history
-    today = datetime.now().strftime("%Y-%m-%d")
-    await db.save_price_history(
-        route_id=route["id"],
-        scan_date=today,
-        cheapest_travel_date=result.cheapest_travel_date,
-        cheapest_return_date=result.cheapest_return_date,
-        cheapest_price=result.cheapest_price,
-        cheapest_airline=result.cheapest_airline,
-        avg_price=result.avg_price,
-        price_data=json.dumps(result.top_days),
-    )
+        snapshots = []
+        for i, day in enumerate(result.top_days):
+            snap = dict(day)
+            snap["is_cheapest"] = i == 0
+            snapshots.append(snap)
+        await db.save_fare_snapshots(route["id"], scan_run_id, snapshots, result.currency)
 
-    stops_label = STOPS_LABELS.get(max_stops) if max_stops != "any" else None
-    msg = format_daily_message(result, prev_cheapest=prev_cheapest, stops_label=stops_label, max_stops=max_stops)
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d")
+        await db.save_price_history(
+            route_id=route["id"],
+            scan_date=today,
+            cheapest_travel_date=result.cheapest_travel_date,
+            cheapest_return_date=result.cheapest_return_date,
+            cheapest_price=result.cheapest_price,
+            cheapest_airline=result.cheapest_airline,
+            avg_price=result.avg_price,
+            price_data=json.dumps(result.top_days),
+            currency=result.currency,
+            provider=result.provider,
+            fare_type=result.fare_type,
+        )
+
+        fx_amounts = None
+        if fx_service:
+            try:
+                fx_amounts = await fx_service.convert(result.cheapest_price, base=result.currency)
+            except Exception:
+                logger.exception("FX conversion failed")
+
+        alert_hits = await evaluate_alerts(
+            db,
+            route,
+            price=result.cheapest_price,
+            travel_date=result.cheapest_travel_date,
+            prev_price=prev_cheapest,
+            stats=stats_before,
+            currency=result.currency,
+        )
+        alert_lines = []
+        for hit in alert_hits:
+            recorded = await db.record_alert_event(
+                route["id"],
+                hit.rule,
+                hit.price,
+                hit.fingerprint,
+                currency=result.currency,
+            )
+            if recorded:
+                alert_lines.append(hit.message)
+
+        stops_label = STOPS_LABELS.get(max_stops) if max_stops != "any" else None
+        send_summary = await _should_send_summary()
+
+        if send_summary:
+            msg = format_daily_message(
+                result,
+                prev_cheapest=prev_cheapest,
+                stops_label=stops_label,
+                max_stops=max_stops,
+                fx_amounts=fx_amounts,
+                alert_lines=alert_lines or None,
+                stats=stats_before if stats_before.get("count") else None,
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        elif alert_lines:
+            msg = format_alert_only_message(result, alert_lines, fx_amounts=fx_amounts)
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+    finally:
+        if use_lock:
+            scanning = context.bot_data.get("_scanning_routes", set())
+            scanning.discard(route["id"])
 
 
 async def _retry_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    """Retry a failed scan (called by JobQueue)."""
-    route = context.job.data
-    await _scan_and_send(context, route, is_retry=True)
+    is_paused = await db.get_config("is_paused")
+    if is_paused == "1":
+        return
+
+    data = context.job.data or {}
+    if isinstance(data, dict) and "route_id" in data:
+        route = await db.get_route(data["route_id"])
+    elif isinstance(data, dict) and "id" in data:
+        route = await db.get_route(data["id"])
+    else:
+        return
+
+    if not route or not route.get("is_active"):
+        return
+
+    await _scan_and_send(context, route, is_retry=True, use_lock=True)
 
 
 async def _scheduled_scan_route(context: ContextTypes.DEFAULT_TYPE):
-    """Repeating job callback for a single route."""
     is_paused = await db.get_config("is_paused")
     if is_paused == "1":
         return
@@ -498,11 +770,9 @@ async def _scheduled_scan_route(context: ContextTypes.DEFAULT_TYPE):
     if not route:
         return
 
-    scanning = context.bot_data.setdefault("_scanning_routes", set())
-    if route["id"] in scanning:
+    # Refresh route in case settings changed
+    fresh = await db.get_route(route["id"])
+    if not fresh or not fresh.get("is_active"):
         return
-    scanning.add(route["id"])
-    try:
-        await _scan_and_send(context, route)
-    finally:
-        scanning.discard(route["id"])
+
+    await _scan_and_send(context, fresh, use_lock=True)

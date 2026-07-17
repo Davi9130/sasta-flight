@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "google-flights": {
+      "source": "skillhq/flight-search",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "2b5535dab04428bb02921c393258b206db3a1810db24163ab9c10ebce87f7dae"
+    }
+  }
+}

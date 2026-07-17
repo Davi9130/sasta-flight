@@ -64,6 +64,9 @@ async def post_init(application: Application):
     db = Database()
     await db.init()
     handlers.db = db
+    from bot.fx import FxService
+
+    handlers.fx_service = FxService(db)
     await schedule_scan_jobs(application)
     logger.info("SastaFlight bot started")
 
@@ -97,6 +100,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handlers.stops_callback, pattern=r"^stops_"))
     application.add_handler(CommandHandler("frequency", handlers.frequency_command))
     application.add_handler(CallbackQueryHandler(handlers.frequency_callback, pattern=r"^freq_"))
+    application.add_handler(CommandHandler("alert", handlers.alert_command))
 
     application.run_polling()
 

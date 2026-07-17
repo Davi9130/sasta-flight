@@ -1,8 +1,8 @@
 # SastaFlight ✈️
 
-Daily flight price scanner Telegram bot. Scans Google Flights for the cheapest days to fly on your routes and sends you a daily summary.
+Daily flight price scanner Telegram bot. Scans Google Flights for the cheapest days to fly on your routes, tracks price history, and alerts you on deals.
 
-**What it does:** Every morning (or whenever you choose), you get a Telegram message with the 5 cheapest days to fly in the next 30 days for each of your saved routes — with prices, airlines, and trends.
+**What it does:** On a schedule (or on demand), you get a Telegram message with the cheapest confirmed days in the next N days for each saved route — with prices in your main currency plus ≈ EUR / USD, airlines, trends, and booking links.
 
 ## Quick Start
 
@@ -68,48 +68,29 @@ python -m bot.main
 Once the bot is running, message it on Telegram:
 
 ```
-/add ATQ BOM          Add a one-way route (Amritsar → Mumbai)
-/add VIX MXP 10       Add round-trip with 10-day stay (Vitória → Milan)
-/check                Scan all routes right now
-/routes               List your saved routes
-/remove 1             Remove route by ID
-/time 07:30           Change daily scan time (default: 08:00 IST)
-/history              See 7-day price trend
-/pause                Pause daily updates
-/resume               Resume daily updates
-/help                 Show all commands
+/add ATQ BOM                 Add a one-way route
+/add VIX MXP 10              Round-trip with 10-day stay
+/add VIX,GIG MXP,BGY 7-10    Multi-airport + flexible stay
+/alert 1 target 2800         Alert when cheapest ≤ 2800
+/alert 1 drop 8              Alert on ≥8% drop vs last scan
+/check                       Scan all routes now
+/routes                      List saved routes
+/remove 1                    Remove route by ID
+/time 07:30                  Change scan start time
+/history                     Price trend + median/low
+/pause                       Pause scheduled scans
+/resume                      Resume scheduled scans
+/help                        Show all commands
 ```
 
 ## Daily Message Example
 
-One-way:
-
 ```
-✈️ ATQ → BOM | Next 30 Days
+✈️ VIX,GIG ⇄ MXP | Next 30 Days | 7-10-day stay
 ━━━━━━━━━━━━━━━━━━━━━━
 
-🏆 Cheapest: Mar 18 (Tue) - R$3,200
-   IndiGo | 06:00 AM | 2h 45m | Nonstop
-
-📊 Top 5 Cheapest Days:
- 1. Mar 18 (Tue) - R$3,200
- 2. Mar 20 (Thu) - R$3,450
- 3. Mar 25 (Tue) - R$3,500
- 4. Mar 12 (Wed) - R$3,800
- 5. Mar 15 (Sat) - R$4,100
-
-📈 Avg: R$5,200 | Low: R$3,200 | High: R$8,900
-
-💡 Trend: Prices dropped 8% since yesterday
-```
-
-Round-trip (`/add VIX MXP 10`):
-
-```
-✈️ VIX ⇄ MXP | Next 30 Days | 10-day stay
-━━━━━━━━━━━━━━━━━━━━━━
-
-🏆 Cheapest: Mar 18 (Tue) → Mar 28 (Fri) - R$4,500
+🏆 Cheapest: Mar 18 (Tue) → Mar 28 (Fri) - R$4,500 (≈ €720 / $780)
+   Airports: GIG → MXP
    TAP | 08:30 PM | 12h 15m | 1 stop
 
 📊 Top 5 Cheapest Days:
@@ -117,7 +98,14 @@ Round-trip (`/add VIX MXP 10`):
  2. Mar 20 (Thu) → Mar 30 (Sat) - R$4,720  [Book →]
 
 📈 Avg: R$5,100 | Low: R$4,500 | High: R$6,200
+📉 Hist median: R$5,300 | Hist low: R$4,400
+
+💡 Trend: Prices dropped 8% since last scan
 ```
+
+EUR/USD amounts are **approximate** conversions (Frankfurter / central-bank rates), not live airline quotes in those currencies.
+
+Split-ticket deals (separate one-way fares cheaper than a round-trip package) are labeled clearly and get two booking links. Separate tickets are riskier (missed connection, baggage, schedule changes).
 
 ## Environment Variables
 
@@ -125,23 +113,42 @@ Round-trip (`/add VIX MXP 10`):
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | Yes | — | Your Telegram chat ID |
-| `DAYS_TO_SCAN` | No | `30` | Number of days ahead to scan |
+| `DAYS_TO_SCAN` | No | `30` | Days ahead to scan |
 | `TOP_CHEAPEST` | No | `5` | How many cheapest days to show |
+| `CANDIDATE_POOL` | No | `12` | Calendar candidates to confirm in detail |
+| `MAX_CONCURRENT_SEARCHES` | No | `3` | Parallel detail lookups |
+| `MAX_AIRPORT_COMBOS` | No | `6` | Cap on origin×destination pairs |
+| `ENABLE_SPLIT_TICKETS` | No | `1` | Compare OW+OW vs round-trip |
 | `TIMEZONE` | No | `Asia/Kolkata` | Timezone for scheduling |
-| `CURRENCY` | No | `BRL` | Price currency (`BRL`, `USD`, `EUR`, `GBP`) |
+| `CURRENCY` | No | `BRL` | Primary currency (`BRL`, `USD`, `EUR`, `GBP`) |
+| `ALWAYS_SEND_SCAN_SUMMARY` | No | `1` | Send full summary every scan (`0` = alerts only) |
+| `DEFAULT_ALERT_DROP_PCT` | No | `5` | Default % drop alert threshold |
+| `DEFAULT_ALERT_COOLDOWN_MINUTES` | No | `360` | Min minutes between alerts |
+| `FARE_PROVIDER` | No | `fli` | Fare provider (`fli` today; extension point) |
 | `DB_PATH` | No | `data/flights.db` | SQLite database path |
 
 ## How It Works
 
-- Uses [Fli](https://github.com/punitarani/fli) to query Google Flights' internal API
-- Only 2 API calls per route per scan (one for date prices, one for flight details)
-- Price history stored in SQLite for trend tracking
-- If a scan fails, it retries once after 4 hours
+1. **Calendar pool** — uses [Fli](https://github.com/punitarani/fli) (`SearchDates`) to score candidate dates (and optional airport / stay combinations).
+2. **Confirm + re-rank** — fetches detailed cheapest flights for the candidate pool, then sorts by **confirmed** price (not calendar estimate).
+3. **Multi-currency display** — quotes are requested in `CURRENCY`; EUR/USD equivalents come from [Frankfurter](https://frankfurter.dev/) with SQLite cache.
+4. **Tracking** — each scan writes `scan_runs` + `fare_snapshots` (intraday history) and a daily `price_history` row for charts.
+5. **Alerts** — target price, % drop vs last scan, and new historical low, with cooldown + fingerprint dedupe.
+
+There is **no official public Google Flights API**. Fli talks to Google’s unofficial internal endpoints and can break or be rate-limited. The bot wraps fares behind a `FareProvider` interface so a future paid/affiliate provider can be plugged in without rewriting handlers.
 
 ## Tech Stack
 
 - Python 3.12
-- [Fli](https://github.com/punitarani/fli) — Google Flights data (no API key needed)
-- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) — Telegram bot framework
-- SQLite — price history and config storage
+- [Fli](https://github.com/punitarani/fli) — Google Flights data (no API key)
+- [Frankfurter](https://frankfurter.dev/) — FX rates (no API key)
+- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) — Telegram bot
+- SQLite — history, FX cache, alerts
 - Docker — containerized deployment
+
+## Tests
+
+```bash
+pip install -r requirements.txt
+pytest
+```
