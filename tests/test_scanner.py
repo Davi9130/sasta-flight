@@ -1,13 +1,20 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta
 
 from bot.scanner import (
-    DayDeal,
+    RATE_LIMITED,
+    RateLimitPaused,
     ScanResult,
+    _date_chunks,
+    _provider_call,
+    _sample_stay_values,
     clear_search_cache,
+    circuit_retry_after_secs,
+    is_circuit_open,
     parse_airport_list,
     parse_stay_range,
+    reset_rate_limiter,
     scan_flight_details,
     scan_route,
     scan_route_dates,
@@ -15,10 +22,16 @@ from bot.scanner import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache_and_limiter(monkeypatch):
     clear_search_cache()
+    reset_rate_limiter()
+    monkeypatch.setattr("bot.scanner.SEARCH_MIN_INTERVAL_SECS", 0.0)
+    monkeypatch.setattr("bot.scanner.CALENDAR_CHUNK_PAUSE_SECS", 0.0)
+    monkeypatch.setattr("bot.scanner.SEARCH_429_BASE_DELAY_SECS", 0.01)
+    monkeypatch.setattr("bot.scanner.SEARCH_CIRCUIT_COOLDOWN_SECS", 60.0)
     yield
     clear_search_cache()
+    reset_rate_limiter()
 
 
 @pytest.fixture
@@ -136,9 +149,7 @@ async def test_scan_route_roundtrip(mock_date_results, mock_flight_results, chea
 @pytest.mark.asyncio
 async def test_scan_route_dates_fallback_generates_dates():
     tomorrow = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    with patch("bot.scanner._scan_roundtrip_dates", return_value=[]), patch(
-        "bot.scanner._scan_oneway_dates", return_value=[]
-    ):
+    with patch("bot.scanner._scan_dates_chunked", return_value=[]):
         result = await scan_route_dates("VIX", "MXP", days=2, stay_days=10)
 
     assert len(result) == 3
@@ -254,7 +265,9 @@ async def test_scan_route_skips_dates_without_matching_flights(mock_date_results
         [valid_flight],
     ]
 
-    result = await scan_route("ATQ", "BOM", max_stops="direct", provider=provider)
+    result = await scan_route(
+        "ATQ", "BOM", max_stops="direct", provider=provider, candidate_pool=7
+    )
     assert result is not None
     assert len(result.top_days) == 5
 
@@ -352,3 +365,139 @@ async def test_roundtrip_rejects_wrong_stay_length(future_outbound_dates):
         provider, "VIX", "MXP", 10, tomorrow, end, "BRL", "BR"
     )
     assert result == []
+
+
+def test_sample_stay_values_with_step(monkeypatch):
+    monkeypatch.setattr("bot.scanner.STAY_SAMPLE_STEP", 2)
+    assert _sample_stay_values(7, 11) == [7, 9, 11]
+
+
+def test_date_chunks_split_long_range():
+    start = datetime(2026, 8, 1)
+    end = datetime(2026, 10, 29)  # ~89 days
+    chunks = _date_chunks(start, end, 30)
+    assert len(chunks) >= 3
+    assert chunks[0][0] == start
+    assert chunks[-1][1] == end
+    # contiguous
+    for i in range(len(chunks) - 1):
+        assert chunks[i][1] + timedelta(days=1) == chunks[i + 1][0]
+
+
+@pytest.mark.asyncio
+async def test_provider_call_retries_on_429_then_succeeds(monkeypatch):
+    monkeypatch.setattr("bot.scanner.SEARCH_429_MAX_RETRIES", 3)
+    monkeypatch.setattr("bot.scanner.SEARCH_CIRCUIT_THRESHOLD", 99)  # don't open circuit
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("HTTP Error 429: rate limited")
+        return "ok"
+
+    result = await _provider_call(flaky)
+    assert result == "ok"
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_circuit_opens_after_threshold(monkeypatch):
+    monkeypatch.setattr("bot.scanner.SEARCH_429_MAX_RETRIES", 0)  # fail fast per call
+    monkeypatch.setattr("bot.scanner.SEARCH_CIRCUIT_THRESHOLD", 3)
+    monkeypatch.setattr("bot.scanner.SEARCH_CIRCUIT_COOLDOWN_SECS", 120.0)
+
+    def always_429():
+        raise RuntimeError("SearchHTTPError: HTTP 429")
+
+    for _ in range(3):
+        with pytest.raises((RuntimeError, RateLimitPaused)):
+            await _provider_call(always_429)
+
+    assert is_circuit_open()
+    assert circuit_retry_after_secs() > 0
+
+    result = await scan_route("ATQ", "BOM", provider=MagicMock(name="mock"))
+    assert result is RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_calendar_chunking_merges_windows(monkeypatch, future_outbound_dates):
+    monkeypatch.setattr("bot.scanner.CALENDAR_CHUNK_DAYS", 2)
+
+    provider = MagicMock()
+    provider.name = "mock"
+
+    def dates_for_window(*args, **kwargs):
+        filters = args[0]
+        start = datetime.strptime(filters.from_date, "%Y-%m-%d")
+        end = datetime.strptime(filters.to_date, "%Y-%m-%d")
+        results = []
+        current = start
+        price = 1000
+        while current <= end:
+            m = MagicMock()
+            m.date = [current]
+            m.price = price
+            results.append(m)
+            current += timedelta(days=1)
+            price += 100
+        return results
+
+    provider.search_dates.side_effect = dates_for_window
+
+    result = await scan_route_dates("ATQ", "BOM", days=5, provider=provider)
+    assert len(result) >= 5
+    assert provider.search_dates.call_count >= 2  # chunked
+    assert result[0]["price"] == min(d["price"] for d in result)
+
+
+@pytest.mark.asyncio
+async def test_split_disabled_by_default_skips_extra_ow(future_outbound_dates):
+    outbound = future_outbound_dates[0]
+    ret = outbound + timedelta(days=10)
+    cal = MagicMock()
+    cal.date = (outbound, ret)
+    cal.price = 5000
+
+    provider = MagicMock()
+    provider.name = "mock"
+    provider.search_dates.return_value = [cal]
+
+    def mk(price):
+        leg = MagicMock()
+        leg.airline.value = "A"
+        leg.departure_datetime = outbound.replace(hour=8, minute=0)
+        f = MagicMock()
+        f.price = price
+        f.duration = 200
+        f.stops = 1
+        f.legs = [leg]
+        return [f]
+
+    provider.search_flights.return_value = [(mk(5000)[0], mk(5000)[0])]
+
+    with patch("bot.scanner.ENABLE_SPLIT_TICKETS", False):
+        result = await scan_route("VIX", "MXP", stay_days=10, provider=provider, candidate_pool=1)
+
+    assert result is not None
+    assert result.fare_type == "roundtrip"
+    # Only the package confirmation call (no OW+OW)
+    assert provider.search_flights.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_min_interval_serializes_calls(monkeypatch):
+    monkeypatch.setattr("bot.scanner.SEARCH_MIN_INTERVAL_SECS", 0.05)
+    monkeypatch.setattr("bot.scanner.SEARCH_CIRCUIT_THRESHOLD", 99)
+    times = []
+
+    def timed():
+        import time as _t
+
+        times.append(_t.monotonic())
+        return 1
+
+    await _provider_call(timed)
+    await _provider_call(timed)
+    assert times[1] - times[0] >= 0.04

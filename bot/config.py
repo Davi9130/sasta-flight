@@ -13,13 +13,23 @@ TOP_CHEAPEST = int(os.getenv("TOP_CHEAPEST", "5"))
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
 DB_PATH = os.getenv("DB_PATH", "data/flights.db")
 
-# Search strategy
-CANDIDATE_POOL = int(os.getenv("CANDIDATE_POOL", "12"))
-MAX_CONCURRENT_SEARCHES = int(os.getenv("MAX_CONCURRENT_SEARCHES", "3"))
+# Search strategy (conservative defaults to avoid Google Flights 429)
+CANDIDATE_POOL = int(os.getenv("CANDIDATE_POOL", "6"))
+MAX_CONCURRENT_SEARCHES = int(os.getenv("MAX_CONCURRENT_SEARCHES", "1"))
 SEARCH_TIMEOUT_SECS = float(os.getenv("SEARCH_TIMEOUT_SECS", "45"))
 MAX_AIRPORT_COMBOS = int(os.getenv("MAX_AIRPORT_COMBOS", "6"))
-ENABLE_SPLIT_TICKETS = os.getenv("ENABLE_SPLIT_TICKETS", "1") != "0"
+ENABLE_SPLIT_TICKETS = os.getenv("ENABLE_SPLIT_TICKETS", "0") != "0"
 SEARCH_CACHE_TTL_SECS = int(os.getenv("SEARCH_CACHE_TTL_SECS", "900"))
+
+# Rate limiting / circuit breaker
+SEARCH_MIN_INTERVAL_SECS = float(os.getenv("SEARCH_MIN_INTERVAL_SECS", "2.0"))
+SEARCH_429_MAX_RETRIES = int(os.getenv("SEARCH_429_MAX_RETRIES", "4"))
+SEARCH_429_BASE_DELAY_SECS = float(os.getenv("SEARCH_429_BASE_DELAY_SECS", "8"))
+SEARCH_CIRCUIT_COOLDOWN_SECS = float(os.getenv("SEARCH_CIRCUIT_COOLDOWN_SECS", "300"))
+SEARCH_CIRCUIT_THRESHOLD = int(os.getenv("SEARCH_CIRCUIT_THRESHOLD", "3"))
+CALENDAR_CHUNK_DAYS = int(os.getenv("CALENDAR_CHUNK_DAYS", "30"))
+CALENDAR_CHUNK_PAUSE_SECS = float(os.getenv("CALENDAR_CHUNK_PAUSE_SECS", "3"))
+STAY_SAMPLE_STEP = max(1, int(os.getenv("STAY_SAMPLE_STEP", "1")))
 
 # Alerts
 DEFAULT_ALERT_DROP_PCT = float(os.getenv("DEFAULT_ALERT_DROP_PCT", "5"))

@@ -361,6 +361,26 @@ def format_error_message(
     )
 
 
+def format_rate_limited_message(
+    from_airport: str,
+    to_airport: str,
+    retry_after_secs: float,
+    stay_days: int | None = None,
+) -> str:
+    route_label = (
+        f"{from_airport} ⇄ {to_airport} ({stay_days} days)"
+        if stay_days
+        else f"{from_airport} → {to_airport}"
+    )
+    minutes = max(1, int((retry_after_secs + 59) // 60))
+    return (
+        f"⏳ {route_label}\n"
+        "Google Flights rate-limited this server (HTTP 429).\n"
+        f"Waiting ~{minutes} min before trying again.\n"
+        "Tip: use fewer airports / narrower stay range, or lower DAYS_TO_SCAN."
+    )
+
+
 def format_retry_failed_message(
     from_airport: str,
     to_airport: str,

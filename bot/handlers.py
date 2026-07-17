@@ -26,10 +26,18 @@ from bot.formatter import (
     format_daily_message,
     format_error_message,
     format_history_message,
+    format_rate_limited_message,
     format_retry_failed_message,
 )
 from bot.fx import FxService
-from bot.scanner import NO_MATCHES, parse_airport_list, parse_stay_range, scan_route
+from bot.scanner import (
+    NO_MATCHES,
+    RATE_LIMITED,
+    circuit_retry_after_secs,
+    parse_airport_list,
+    parse_stay_range,
+    scan_route,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -595,6 +603,32 @@ async def _scan_and_send(
         )
 
         duration_ms = int((time.monotonic() - started) * 1000)
+
+        if result is RATE_LIMITED:
+            retry_after = circuit_retry_after_secs() or 300
+            await db.create_scan_run(
+                route["id"],
+                "rate_limited",
+                provider="fli",
+                currency=CURRENCY,
+                duration_ms=duration_ms,
+                error=f"HTTP 429 / circuit open; retry_after={retry_after:.0f}s",
+                filters_json=json.dumps({"max_stops": max_stops}),
+            )
+            msg = format_rate_limited_message(
+                from_code, to_code, retry_after, stay_days=stay_days
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+            # Schedule a single retry after the circuit cooldown (deduped)
+            existing = context.job_queue.get_jobs_by_name(f"retry_{route['id']}")
+            if not existing and not is_retry:
+                context.job_queue.run_once(
+                    _retry_scan_job,
+                    when=max(60, int(retry_after) + 30),
+                    data={"route_id": route["id"]},
+                    name=f"retry_{route['id']}",
+                )
+            return
 
         if result is NO_MATCHES:
             await db.create_scan_run(

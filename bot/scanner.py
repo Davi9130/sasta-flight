@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -22,6 +23,8 @@ from fli.models import (
 )
 
 from bot.config import (
+    CALENDAR_CHUNK_DAYS,
+    CALENDAR_CHUNK_PAUSE_SECS,
     CANDIDATE_POOL,
     COUNTRY,
     CURRENCY,
@@ -29,8 +32,14 @@ from bot.config import (
     ENABLE_SPLIT_TICKETS,
     MAX_AIRPORT_COMBOS,
     MAX_CONCURRENT_SEARCHES,
+    SEARCH_429_BASE_DELAY_SECS,
+    SEARCH_429_MAX_RETRIES,
     SEARCH_CACHE_TTL_SECS,
+    SEARCH_CIRCUIT_COOLDOWN_SECS,
+    SEARCH_CIRCUIT_THRESHOLD,
+    SEARCH_MIN_INTERVAL_SECS,
     SEARCH_TIMEOUT_SECS,
+    STAY_SAMPLE_STEP,
     TOP_CHEAPEST,
 )
 from bot.providers import FareProvider, get_fare_provider
@@ -39,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 # Sentinel: scan found dates but no flights matched the stops filter.
 NO_MATCHES = "NO_MATCHES"
+# Sentinel: Google Flights rate-limited / circuit open.
+RATE_LIMITED = "RATE_LIMITED"
 
 STOPS_MAP = {
     "any": MaxStops.ANY,
@@ -49,6 +60,20 @@ STOPS_MAP = {
 
 _search_cache: dict[str, tuple[float, object]] = {}
 _cache_lock = asyncio.Lock()
+
+# Global rate limiter state
+_rate_lock = asyncio.Lock()
+_last_request_at = 0.0
+_consecutive_429 = 0
+_circuit_open_until = 0.0
+
+
+class RateLimitPaused(Exception):
+    """Circuit breaker is open; scans should stop briefly."""
+
+    def __init__(self, retry_after_secs: float):
+        self.retry_after_secs = retry_after_secs
+        super().__init__(f"Rate limit circuit open for {retry_after_secs:.0f}s")
 
 
 @dataclass
@@ -180,6 +205,125 @@ def _cache_key(*parts) -> str:
     return "|".join(str(p) for p in parts)
 
 
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "429" in text:
+        return True
+    if "rate" in text and ("limit" in text or "blocked" in text):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        return _is_rate_limit_error(cause)
+    return False
+
+
+def circuit_retry_after_secs() -> float:
+    remaining = _circuit_open_until - time.monotonic()
+    return max(0.0, remaining)
+
+
+def is_circuit_open() -> bool:
+    return circuit_retry_after_secs() > 0
+
+
+def reset_rate_limiter():
+    """Test helper: clear limiter / circuit state."""
+    global _last_request_at, _consecutive_429, _circuit_open_until
+    _last_request_at = 0.0
+    _consecutive_429 = 0
+    _circuit_open_until = 0.0
+
+
+def _sample_stay_values(stay_min: int, stay_max: int) -> list[int]:
+    step = STAY_SAMPLE_STEP
+    values = list(range(stay_min, stay_max + 1, step))
+    if stay_max not in values:
+        values.append(stay_max)
+    return values
+
+
+def _date_chunks(start: datetime, end: datetime, chunk_days: int) -> list[tuple[datetime, datetime]]:
+    """Inclusive date range split into chunks of at most chunk_days span."""
+    chunks: list[tuple[datetime, datetime]] = []
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=chunk_days), end)
+        chunks.append((current, chunk_end))
+        current = chunk_end + timedelta(days=1)
+    return chunks
+
+
+async def _wait_for_rate_slot():
+    global _last_request_at
+    async with _rate_lock:
+        now = time.monotonic()
+        if now < _circuit_open_until:
+            raise RateLimitPaused(_circuit_open_until - now)
+        wait = SEARCH_MIN_INTERVAL_SECS - (now - _last_request_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _note_success():
+    global _consecutive_429
+    _consecutive_429 = 0
+
+
+def _note_429() -> float:
+    """Record a 429 and possibly open the circuit. Returns backoff delay secs."""
+    global _consecutive_429, _circuit_open_until
+    _consecutive_429 += 1
+    attempt = min(_consecutive_429, SEARCH_429_MAX_RETRIES)
+    delay = SEARCH_429_BASE_DELAY_SECS * (2 ** (attempt - 1))
+    delay *= 0.8 + random.random() * 0.4  # jitter
+    if _consecutive_429 >= SEARCH_CIRCUIT_THRESHOLD:
+        _circuit_open_until = time.monotonic() + SEARCH_CIRCUIT_COOLDOWN_SECS
+        logger.warning(
+            "Rate-limit circuit OPEN for %.0fs after %d consecutive 429s",
+            SEARCH_CIRCUIT_COOLDOWN_SECS,
+            _consecutive_429,
+        )
+    return delay
+
+
+async def _provider_call(func, *args, **kwargs):
+    """Call provider with min-interval gating, 429 retry/backoff, and circuit breaker."""
+    last_exc: BaseException | None = None
+    for attempt in range(SEARCH_429_MAX_RETRIES + 1):
+        await _wait_for_rate_slot()
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(func, *args, **kwargs),
+                timeout=SEARCH_TIMEOUT_SECS,
+            )
+            _note_success()
+            return result
+        except RateLimitPaused:
+            raise
+        except Exception as exc:
+            if not _is_rate_limit_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= SEARCH_429_MAX_RETRIES:
+                break
+            delay = _note_429()
+            if is_circuit_open():
+                raise RateLimitPaused(circuit_retry_after_secs()) from exc
+            logger.warning(
+                "Google Flights 429 (attempt %d/%d), backing off %.1fs",
+                attempt + 1,
+                SEARCH_429_MAX_RETRIES + 1,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    _note_429()
+    if is_circuit_open():
+        raise RateLimitPaused(circuit_retry_after_secs()) from last_exc
+    raise last_exc
+
+
 async def _cached_call(key: str, coro_factory):
     now = time.monotonic()
     async with _cache_lock:
@@ -194,14 +338,7 @@ async def _cached_call(key: str, coro_factory):
     return result
 
 
-async def _run_with_timeout(func, *args, **kwargs):
-    return await asyncio.wait_for(
-        asyncio.to_thread(func, *args, **kwargs),
-        timeout=SEARCH_TIMEOUT_SECS,
-    )
-
-
-async def _scan_oneway_dates(
+async def _scan_oneway_dates_window(
     provider: FareProvider,
     from_code: str,
     to_code: str,
@@ -219,7 +356,7 @@ async def _scan_oneway_dates(
     key = _cache_key("dates", provider.name, from_code, to_code, start, end, currency, "ow")
 
     async def _call():
-        return await _run_with_timeout(
+        return await _provider_call(
             provider.search_dates, filters, currency=currency, country=country
         )
 
@@ -240,7 +377,7 @@ async def _scan_oneway_dates(
     return sorted(date_prices, key=lambda x: x["price"])
 
 
-async def _scan_roundtrip_dates(
+async def _scan_roundtrip_dates_window(
     provider: FareProvider,
     from_code: str,
     to_code: str,
@@ -267,7 +404,7 @@ async def _scan_roundtrip_dates(
     )
 
     async def _call():
-        return await _run_with_timeout(
+        return await _provider_call(
             provider.search_dates, filters, currency=currency, country=country
         )
 
@@ -295,6 +432,37 @@ async def _scan_roundtrip_dates(
             }
         )
     return sorted(date_prices, key=lambda x: x["price"])
+
+
+async def _scan_dates_chunked(
+    *,
+    provider: FareProvider,
+    from_code: str,
+    to_code: str,
+    start: datetime,
+    end: datetime,
+    stay_days: int | None,
+    currency: str,
+    country: str,
+) -> list[dict]:
+    span_days = (end - start).days
+    chunks = _date_chunks(start, end, CALENDAR_CHUNK_DAYS) if span_days > CALENDAR_CHUNK_DAYS else [(start, end)]
+    merged: list[dict] = []
+    for i, (c_start, c_end) in enumerate(chunks):
+        if stay_days:
+            part = await _scan_roundtrip_dates_window(
+                provider, from_code, to_code, stay_days, c_start, c_end, currency, country
+            )
+        else:
+            part = await _scan_oneway_dates_window(
+                provider, from_code, to_code, c_start, c_end, currency, country
+            )
+        merged.extend(part)
+        if i < len(chunks) - 1 and CALENDAR_CHUNK_PAUSE_SECS > 0:
+            await asyncio.sleep(CALENDAR_CHUNK_PAUSE_SECS)
+    if not merged:
+        return []
+    return sorted(merged, key=lambda x: x["price"])
 
 
 def _generate_outbound_dates(
@@ -336,8 +504,15 @@ async def scan_route_dates(
     end_date = tomorrow + timedelta(days=days)
 
     if stay_days:
-        date_prices = await _scan_roundtrip_dates(
-            provider, from_code, to_code, stay_days, tomorrow, end_date, currency, country
+        date_prices = await _scan_dates_chunked(
+            provider=provider,
+            from_code=from_code,
+            to_code=to_code,
+            start=tomorrow,
+            end=end_date,
+            stay_days=stay_days,
+            currency=currency,
+            country=country,
         )
         if date_prices:
             return date_prices
@@ -347,8 +522,15 @@ async def scan_route_dates(
             to_code,
             stay_days,
         )
-        oneway_prices = await _scan_oneway_dates(
-            provider, from_code, to_code, tomorrow, end_date, currency, country
+        oneway_prices = await _scan_dates_chunked(
+            provider=provider,
+            from_code=from_code,
+            to_code=to_code,
+            start=tomorrow,
+            end=end_date,
+            stay_days=None,
+            currency=currency,
+            country=country,
         )
         if oneway_prices:
             for day in oneway_prices:
@@ -363,8 +545,15 @@ async def scan_route_dates(
         )
         return _generate_outbound_dates(tomorrow, end_date, stay_days, from_code, to_code)
 
-    oneway_prices = await _scan_oneway_dates(
-        provider, from_code, to_code, tomorrow, end_date, currency, country
+    oneway_prices = await _scan_dates_chunked(
+        provider=provider,
+        from_code=from_code,
+        to_code=to_code,
+        start=tomorrow,
+        end=end_date,
+        stay_days=None,
+        currency=currency,
+        country=country,
     )
     if oneway_prices:
         return oneway_prices
@@ -374,6 +563,19 @@ async def scan_route_dates(
         to_code,
     )
     return _generate_outbound_dates(tomorrow, end_date, from_code=from_code, to_code=to_code)
+
+
+# Back-compat aliases used by older tests
+async def _scan_oneway_dates(provider, from_code, to_code, start, end, currency, country):
+    return await _scan_oneway_dates_window(
+        provider, from_code, to_code, start, end, currency, country
+    )
+
+
+async def _scan_roundtrip_dates(provider, from_code, to_code, stay_days, start, end, currency, country):
+    return await _scan_roundtrip_dates_window(
+        provider, from_code, to_code, stay_days, start, end, currency, country
+    )
 
 
 async def scan_flight_details(
@@ -422,7 +624,7 @@ async def scan_flight_details(
     )
 
     async def _call():
-        return await _run_with_timeout(
+        return await _provider_call(
             provider.search_flights, filters, currency=currency, country=country
         )
 
@@ -449,6 +651,7 @@ async def _confirm_candidate(
     currency: str,
     country: str,
     semaphore: asyncio.Semaphore,
+    check_split: bool = False,
 ) -> DayDeal | None:
     from_code = candidate["from_airport"]
     to_code = candidate["to_airport"]
@@ -468,8 +671,25 @@ async def _confirm_candidate(
                 currency=currency,
                 country=country,
             )
-        except Exception:
-            logger.exception("Failed to confirm candidate %s %s->%s", travel_date, from_code, to_code)
+        except RateLimitPaused:
+            raise
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                logger.warning(
+                    "Rate limited confirming %s %s->%s: %s",
+                    travel_date,
+                    from_code,
+                    to_code,
+                    exc,
+                )
+                raise RateLimitPaused(circuit_retry_after_secs() or SEARCH_CIRCUIT_COOLDOWN_SECS) from exc
+            logger.warning(
+                "Failed to confirm candidate %s %s->%s: %s",
+                travel_date,
+                from_code,
+                to_code,
+                exc,
+            )
             return None
 
     if details is None:
@@ -494,7 +714,7 @@ async def _confirm_candidate(
         calendar_price=candidate.get("price"),
     )
 
-    if is_rt and ENABLE_SPLIT_TICKETS and return_date:
+    if check_split and is_rt and ENABLE_SPLIT_TICKETS and return_date:
         try:
             async with semaphore:
                 outbound = await scan_flight_details(
@@ -527,8 +747,10 @@ async def _confirm_candidate(
                     deal.departure = outbound.get("departure")
                     deal.duration = outbound.get("duration")
                     deal.stops = outbound.get("stops")
-        except Exception:
-            logger.exception("Split-ticket check failed for %s", travel_date)
+        except RateLimitPaused:
+            raise
+        except Exception as exc:
+            logger.warning("Split-ticket check failed for %s: %s", travel_date, exc)
 
     return deal
 
@@ -572,6 +794,45 @@ def _deal_to_dict(deal: DayDeal) -> dict:
     return data
 
 
+async def _maybe_apply_split(
+    deals: list[DayDeal],
+    *,
+    max_stops: str,
+    provider: FareProvider,
+    currency: str,
+    country: str,
+    semaphore: asyncio.Semaphore,
+) -> list[DayDeal]:
+    """Only check split tickets on the current cheapest deal to limit extra calls."""
+    if not ENABLE_SPLIT_TICKETS or not deals:
+        return deals
+    best = deals[0]
+    if best.fare_type != "roundtrip" or not best.return_date:
+        return deals
+    candidate = {
+        "from_airport": best.from_airport,
+        "to_airport": best.to_airport,
+        "date": best.date,
+        "return_date": best.return_date,
+        "price": best.calendar_price,
+    }
+    updated = await _confirm_candidate(
+        candidate,
+        max_stops,
+        _stay_length(best.date, best.return_date),
+        _stay_length(best.date, best.return_date),
+        provider=provider,
+        currency=currency,
+        country=country,
+        semaphore=semaphore,
+        check_split=True,
+    )
+    if updated and updated.fare_type == "split" and updated.price < best.price:
+        deals[0] = updated
+        deals.sort(key=lambda d: d.price)
+    return deals
+
+
 async def _collect_calendar_candidates(
     from_airports: list[str],
     to_airports: list[str],
@@ -588,7 +849,7 @@ async def _collect_calendar_candidates(
     if stay_min is None:
         stay_values = [None]
     else:
-        stay_values = list(range(stay_min, (stay_max or stay_min) + 1))
+        stay_values = _sample_stay_values(stay_min, stay_max or stay_min)
 
     all_candidates: list[dict] = []
     for from_code, to_code in pairs:
@@ -603,8 +864,20 @@ async def _collect_calendar_candidates(
                     currency=currency,
                     country=country,
                 )
-            except Exception:
-                logger.exception("Calendar scan failed for %s->%s stay=%s", from_code, to_code, stay)
+            except RateLimitPaused:
+                raise
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    raise RateLimitPaused(
+                        circuit_retry_after_secs() or SEARCH_CIRCUIT_COOLDOWN_SECS
+                    ) from exc
+                logger.warning(
+                    "Calendar scan failed for %s->%s stay=%s: %s",
+                    from_code,
+                    to_code,
+                    stay,
+                    exc,
+                )
                 continue
             for day in prices:
                 day.setdefault("from_airport", from_code)
@@ -614,11 +887,9 @@ async def _collect_calendar_candidates(
                     day.setdefault("return_date", _return_date(day["date"], stay))
                 all_candidates.append(day)
 
-    # Prefer calendar-priced entries; fall back to generated dates without price.
     priced = [c for c in all_candidates if "price" in c]
     if priced:
         priced.sort(key=lambda x: x["price"])
-        # Deduplicate by route+dates keeping cheapest calendar estimate
         seen = set()
         unique = []
         for c in priced:
@@ -629,7 +900,6 @@ async def _collect_calendar_candidates(
             unique.append(c)
         return unique
 
-    # No prices: keep generated dates unique
     seen = set()
     unique = []
     for c in all_candidates:
@@ -655,6 +925,9 @@ async def scan_route(
     candidate_pool: int = CANDIDATE_POOL,
 ) -> ScanResult | str | None:
     """Full scan: calendar candidates → confirm top pool → re-rank by confirmed price."""
+    if is_circuit_open():
+        return RATE_LIMITED
+
     provider = provider or get_fare_provider()
     from_airports = parse_airport_list(from_code)
     to_airports = parse_airport_list(to_code)
@@ -675,6 +948,8 @@ async def scan_route(
             currency=currency,
             country=country,
         )
+    except RateLimitPaused:
+        return RATE_LIMITED
     except Exception:
         logger.exception("Failed to scan dates for %s -> %s", from_airports, to_airports)
         return None
@@ -685,25 +960,46 @@ async def scan_route(
 
     pool = candidates[: max(candidate_pool, TOP_CHEAPEST)]
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
-    tasks = [
-        _confirm_candidate(
-            candidate,
-            max_stops,
-            stay_min,
-            stay_max,
+    confirmed: list[DayDeal] = []
+    rate_limited = False
+    # Confirm with bounded concurrency; stop early on circuit open but keep partials.
+    for candidate in pool:
+        try:
+            deal = await _confirm_candidate(
+                candidate,
+                max_stops,
+                stay_min,
+                stay_max,
+                provider=provider,
+                currency=currency,
+                country=country,
+                semaphore=semaphore,
+                check_split=False,
+            )
+        except RateLimitPaused:
+            rate_limited = True
+            break
+        if deal is not None:
+            confirmed.append(deal)
+
+    deals = _dedupe_deals(confirmed)
+    if not deals:
+        if rate_limited or is_circuit_open():
+            return RATE_LIMITED
+        logger.warning("No flights matching stops preference for %s -> %s", from_airports, to_airports)
+        return NO_MATCHES
+
+    try:
+        deals = await _maybe_apply_split(
+            deals,
+            max_stops=max_stops,
             provider=provider,
             currency=currency,
             country=country,
             semaphore=semaphore,
         )
-        for candidate in pool
-    ]
-    confirmed = await asyncio.gather(*tasks)
-    deals = _dedupe_deals([d for d in confirmed if d is not None])
-
-    if not deals:
-        logger.warning("No flights matching stops preference for %s -> %s", from_airports, to_airports)
-        return NO_MATCHES
+    except RateLimitPaused:
+        pass  # keep package fares
 
     top = deals[:TOP_CHEAPEST]
     detail_prices = [d.price for d in deals]

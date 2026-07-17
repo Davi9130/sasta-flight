@@ -115,10 +115,18 @@ Split-ticket deals (separate one-way fares cheaper than a round-trip package) ar
 | `TELEGRAM_CHAT_ID` | Yes | — | Your Telegram chat ID |
 | `DAYS_TO_SCAN` | No | `30` | Days ahead to scan |
 | `TOP_CHEAPEST` | No | `5` | How many cheapest days to show |
-| `CANDIDATE_POOL` | No | `12` | Calendar candidates to confirm in detail |
-| `MAX_CONCURRENT_SEARCHES` | No | `3` | Parallel detail lookups |
+| `CANDIDATE_POOL` | No | `6` | Calendar candidates to confirm in detail |
+| `MAX_CONCURRENT_SEARCHES` | No | `1` | Parallel detail lookups (keep at 1 to avoid 429) |
 | `MAX_AIRPORT_COMBOS` | No | `6` | Cap on origin×destination pairs |
-| `ENABLE_SPLIT_TICKETS` | No | `1` | Compare OW+OW vs round-trip |
+| `ENABLE_SPLIT_TICKETS` | No | `0` | Compare OW+OW vs round-trip (extra API calls) |
+| `SEARCH_MIN_INTERVAL_SECS` | No | `2.0` | Minimum gap between Google Flights calls |
+| `SEARCH_429_MAX_RETRIES` | No | `4` | Retries on HTTP 429 with backoff |
+| `SEARCH_429_BASE_DELAY_SECS` | No | `8` | Base delay for 429 exponential backoff |
+| `SEARCH_CIRCUIT_THRESHOLD` | No | `3` | Consecutive 429s before circuit opens |
+| `SEARCH_CIRCUIT_COOLDOWN_SECS` | No | `300` | Pause scans while circuit is open |
+| `CALENDAR_CHUNK_DAYS` | No | `30` | Split long calendars into chunks |
+| `CALENDAR_CHUNK_PAUSE_SECS` | No | `3` | Pause between calendar chunks |
+| `STAY_SAMPLE_STEP` | No | `1` | Sample every N days in a stay range (use `2` for wide ranges) |
 | `TIMEZONE` | No | `Asia/Kolkata` | Timezone for scheduling |
 | `CURRENCY` | No | `BRL` | Primary currency (`BRL`, `USD`, `EUR`, `GBP`) |
 | `ALWAYS_SEND_SCAN_SUMMARY` | No | `1` | Send full summary every scan (`0` = alerts only) |
@@ -129,11 +137,12 @@ Split-ticket deals (separate one-way fares cheaper than a round-trip package) ar
 
 ## How It Works
 
-1. **Calendar pool** — uses [Fli](https://github.com/punitarani/fli) (`SearchDates`) to score candidate dates (and optional airport / stay combinations).
-2. **Confirm + re-rank** — fetches detailed cheapest flights for the candidate pool, then sorts by **confirmed** price (not calendar estimate).
-3. **Multi-currency display** — quotes are requested in `CURRENCY`; EUR/USD equivalents come from [Frankfurter](https://frankfurter.dev/) with SQLite cache.
-4. **Tracking** — each scan writes `scan_runs` + `fare_snapshots` (intraday history) and a daily `price_history` row for charts.
-5. **Alerts** — target price, % drop vs last scan, and new historical low, with cooldown + fingerprint dedupe.
+1. **Calendar pool** — uses [Fli](https://github.com/punitarani/fli) (`SearchDates`) to score candidate dates (and optional airport / stay combinations), chunked for long windows.
+2. **Confirm + re-rank** — fetches detailed cheapest flights for the candidate pool (rate-limited), then sorts by **confirmed** price (not calendar estimate).
+3. **Rate limiting** — global min-interval between Google calls, exponential backoff on HTTP 429, and a circuit breaker that pauses scans when Google keeps blocking.
+4. **Multi-currency display** — quotes are requested in `CURRENCY`; EUR/USD equivalents come from [Frankfurter](https://frankfurter.dev/) with SQLite cache.
+5. **Tracking** — each scan writes `scan_runs` + `fare_snapshots` (intraday history) and a daily `price_history` row for charts.
+6. **Alerts** — target price, % drop vs last scan, and new historical low, with cooldown + fingerprint dedupe.
 
 There is **no official public Google Flights API**. Fli talks to Google’s unofficial internal endpoints and can break or be rate-limited. The bot wraps fares behind a `FareProvider` interface so a future paid/affiliate provider can be plugged in without rewriting handlers.
 
