@@ -31,10 +31,10 @@ CALENDAR_CHUNK_DAYS = int(os.getenv("CALENDAR_CHUNK_DAYS", "30"))
 CALENDAR_CHUNK_PAUSE_SECS = float(os.getenv("CALENDAR_CHUNK_PAUSE_SECS", "3"))
 STAY_SAMPLE_STEP = max(1, int(os.getenv("STAY_SAMPLE_STEP", "1")))
 
-# Alerts
+# Alerts — silent by default; notify only when route target_price is hit
 DEFAULT_ALERT_DROP_PCT = float(os.getenv("DEFAULT_ALERT_DROP_PCT", "5"))
 DEFAULT_ALERT_COOLDOWN_MINUTES = int(os.getenv("DEFAULT_ALERT_COOLDOWN_MINUTES", "360"))
-ALWAYS_SEND_SCAN_SUMMARY = os.getenv("ALWAYS_SEND_SCAN_SUMMARY", "1") != "0"
+ALWAYS_SEND_SCAN_SUMMARY = os.getenv("ALWAYS_SEND_SCAN_SUMMARY", "0") != "0"
 
 # FX
 FX_CACHE_HOURS = int(os.getenv("FX_CACHE_HOURS", "24"))

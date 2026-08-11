@@ -164,15 +164,70 @@ async def test_scan_and_send_rate_limited_message():
 @pytest.mark.asyncio
 async def test_scan_and_send_persists_snapshots_and_alerts():
     from bot.handlers import _scan_and_send
+    from bot.alerts import AlertHit
 
     route = {
         "id": 1,
         "from_airport": "ATQ",
         "to_airport": "BOM",
         "target_price": 3500,
-        "alert_drop_pct": 5,
-        "alert_on_new_low": 1,
+        "alert_drop_pct": None,
+        "alert_on_new_low": 0,
         "alert_cooldown_minutes": 60,
+    }
+    result = ScanResult(
+        from_airport="ATQ",
+        to_airport="BOM",
+        cheapest_price=3000,
+        cheapest_travel_date="2026-03-18",
+        cheapest_airline="IndiGo",
+        cheapest_departure="06:00 AM",
+        cheapest_duration=165,
+        cheapest_stops=0,
+        top_days=[{"date": "2026-03-18", "price": 3000, "from_airport": "ATQ", "to_airport": "BOM"}],
+        avg_price=4000,
+        min_price=3000,
+        max_price=5000,
+        currency="BRL",
+        provider="fli",
+        from_airports=["ATQ"],
+        to_airports=["BOM"],
+    )
+    mock_context = MagicMock()
+    mock_context.bot.send_message = AsyncMock()
+    mock_context.bot_data = {}
+    hit = AlertHit(rule="target", message="🎯 Target hit", fingerprint="fp", price=3000)
+
+    with patch("bot.handlers.db") as mock_db, patch(
+        "bot.handlers.scan_route", new_callable=AsyncMock, return_value=result
+    ), patch("bot.handlers.fx_service", None), patch(
+        "bot.handlers.evaluate_alerts", new_callable=AsyncMock, return_value=[hit]
+    ), patch("bot.handlers.ALWAYS_SEND_SCAN_SUMMARY", False):
+        mock_db.get_route_stops_preference = AsyncMock(return_value="any")
+        mock_db.get_previous_cheapest = AsyncMock(return_value=4000)
+        mock_db.get_route_price_stats = AsyncMock(return_value={"count": 1, "min": 3500, "median": 3600})
+        mock_db.create_scan_run = AsyncMock(return_value=9)
+        mock_db.save_fare_snapshots = AsyncMock()
+        mock_db.save_price_history = AsyncMock()
+        mock_db.record_alert_event = AsyncMock(return_value=True)
+        sent = await _scan_and_send(mock_context, route)
+        mock_db.save_fare_snapshots.assert_called_once()
+        mock_db.save_price_history.assert_called_once()
+        mock_context.bot.send_message.assert_called_once()
+        assert sent is True
+
+
+@pytest.mark.asyncio
+async def test_scan_silent_when_above_target():
+    from bot.handlers import _scan_and_send
+
+    route = {
+        "id": 1,
+        "from_airport": "ATQ",
+        "to_airport": "BOM",
+        "target_price": 2500,
+        "alert_drop_pct": None,
+        "alert_on_new_low": 0,
     }
     result = ScanResult(
         from_airport="ATQ",
@@ -200,15 +255,85 @@ async def test_scan_and_send_persists_snapshots_and_alerts():
         "bot.handlers.scan_route", new_callable=AsyncMock, return_value=result
     ), patch("bot.handlers.fx_service", None), patch(
         "bot.handlers.evaluate_alerts", new_callable=AsyncMock, return_value=[]
-    ):
+    ), patch("bot.handlers.ALWAYS_SEND_SCAN_SUMMARY", False):
         mock_db.get_route_stops_preference = AsyncMock(return_value="any")
-        mock_db.get_previous_cheapest = AsyncMock(return_value=4000)
-        mock_db.get_route_price_stats = AsyncMock(return_value={"count": 1, "min": 3500, "median": 3600})
-        mock_db.create_scan_run = AsyncMock(return_value=9)
+        mock_db.get_previous_cheapest = AsyncMock(return_value=None)
+        mock_db.get_route_price_stats = AsyncMock(return_value={"count": 0})
+        mock_db.create_scan_run = AsyncMock(return_value=1)
         mock_db.save_fare_snapshots = AsyncMock()
         mock_db.save_price_history = AsyncMock()
-        mock_db.get_config = AsyncMock(return_value="1")
-        await _scan_and_send(mock_context, route)
-        mock_db.save_fare_snapshots.assert_called_once()
+        sent = await _scan_and_send(mock_context, route)
         mock_db.save_price_history.assert_called_once()
-        mock_context.bot.send_message.assert_called_once()
+        mock_context.bot.send_message.assert_not_called()
+        assert sent is False
+
+
+@pytest.mark.asyncio
+async def test_scan_silent_without_target():
+    from bot.handlers import _scan_and_send
+
+    route = {
+        "id": 1,
+        "from_airport": "ATQ",
+        "to_airport": "BOM",
+        "target_price": None,
+        "alert_drop_pct": None,
+        "alert_on_new_low": 0,
+    }
+    result = ScanResult(
+        from_airport="ATQ",
+        to_airport="BOM",
+        cheapest_price=2000,
+        cheapest_travel_date="2026-03-18",
+        cheapest_airline="IndiGo",
+        cheapest_departure="06:00 AM",
+        cheapest_duration=165,
+        cheapest_stops=0,
+        top_days=[{"date": "2026-03-18", "price": 2000, "from_airport": "ATQ", "to_airport": "BOM"}],
+        avg_price=3000,
+        min_price=2000,
+        max_price=4000,
+        currency="BRL",
+        provider="fli",
+        from_airports=["ATQ"],
+        to_airports=["BOM"],
+    )
+    mock_context = MagicMock()
+    mock_context.bot.send_message = AsyncMock()
+    mock_context.bot_data = {}
+
+    with patch("bot.handlers.db") as mock_db, patch(
+        "bot.handlers.scan_route", new_callable=AsyncMock, return_value=result
+    ), patch("bot.handlers.fx_service", None), patch(
+        "bot.handlers.evaluate_alerts", new_callable=AsyncMock, return_value=[]
+    ), patch("bot.handlers.ALWAYS_SEND_SCAN_SUMMARY", False):
+        mock_db.get_route_stops_preference = AsyncMock(return_value="any")
+        mock_db.get_previous_cheapest = AsyncMock(return_value=None)
+        mock_db.get_route_price_stats = AsyncMock(return_value={"count": 0})
+        mock_db.create_scan_run = AsyncMock(return_value=1)
+        mock_db.save_fare_snapshots = AsyncMock()
+        mock_db.save_price_history = AsyncMock()
+        sent = await _scan_and_send(mock_context, route)
+        mock_context.bot.send_message.assert_not_called()
+        assert sent is False
+
+
+@pytest.mark.asyncio
+async def test_check_command_ack_when_no_alerts():
+    from bot.handlers import check_command
+
+    update = MagicMock()
+    update.effective_chat.id = 123
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.bot_data = {}
+
+    routes = [{"id": 1, "from_airport": "ATQ", "to_airport": "BOM"}]
+    with patch("bot.handlers.CHAT_ID", 123), patch("bot.handlers.db") as mock_db, patch(
+        "bot.handlers._scan_and_send", new_callable=AsyncMock, return_value=False
+    ):
+        mock_db.get_active_routes = AsyncMock(return_value=routes)
+        await check_command(update, context)
+        texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Scanning" in t for t in texts)
+        assert any("Nenhuma rota no target" in t or "Scan done" in t for t in texts)

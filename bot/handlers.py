@@ -14,7 +14,6 @@ from bot.config import (
     COUNTRY,
     CURRENCY,
     DEFAULT_ALERT_COOLDOWN_MINUTES,
-    DEFAULT_ALERT_DROP_PCT,
     INTERVAL_OPTIONS,
     MAX_STAY_DAYS,
     MIN_STAY_DAYS,
@@ -87,16 +86,18 @@ def _help_text() -> str:
         "/routes - List active routes\n"
         "/stops - Set default stops preference\n"
         "/frequency - Set scan frequency\n"
-        "/alert <id> target <price> - Alert when price ≤ target\n"
-        "/alert <id> drop <pct> - Alert on % drop vs last scan\n"
+        "/alert <id> target <price> - Notify only when price ≤ target\n"
+        "/alert <id> drop <pct> - Optional: also alert on % drop\n"
         "/alert <id> clear - Clear target price\n"
-        "/check - Scan all routes now\n"
+        "/check - Scan all routes now (silent unless target hit)\n"
         f"/time <HH:MM> - Set scan start time (24h, {TIMEZONE})\n"
         "/history - Price trend + stats\n"
         "/pause - Pause scheduled scans\n"
         "/resume - Resume scheduled scans\n"
         "/help - Show this message\n\n"
-        f"Prices shown in {CURRENCY} with ≈ EUR / USD when available."
+        f"Prices tracked in {CURRENCY} (≈ EUR / USD when available).\n"
+        "By default scans stay silent and only notify when a route hits its target.\n"
+        "Set a target with /alert <id> target <price> — history is always saved."
     )
 
 
@@ -238,10 +239,12 @@ async def routes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert_bits = []
         if r.get("target_price") is not None:
             alert_bits.append(f"target≤{r['target_price']:g}")
+        else:
+            alert_bits.append("silent")
         drop = r.get("alert_drop_pct")
         if drop is not None:
             alert_bits.append(f"drop≥{drop:g}%")
-        alert_txt = f" | alerts: {', '.join(alert_bits)}" if alert_bits else ""
+        alert_txt = f" | {', '.join(alert_bits)}"
         lines.append(
             f"  {r['id']}. {_route_label(r)} | {stops_label} | Every {freq_label}{alert_txt}"
         )
@@ -272,11 +275,11 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
             "Usage:\n"
-            "/alert <id> target <price>\n"
-            "/alert <id> drop <pct>\n"
-            "/alert <id> clear\n"
-            f"Defaults: drop {DEFAULT_ALERT_DROP_PCT:g}%, "
-            f"cooldown {DEFAULT_ALERT_COOLDOWN_MINUTES}m"
+            "/alert <id> target <price> — notify only when ≤ price\n"
+            "/alert <id> drop <pct> — optional extra rule\n"
+            "/alert <id> clear — clear target\n"
+            "Scans keep saving history; Telegram alerts only on rules.\n"
+            f"Cooldown: {DEFAULT_ALERT_COOLDOWN_MINUTES}m"
         )
         return
 
@@ -294,7 +297,10 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "clear":
         await db.clear_route_target_price(route_id)
-        await update.message.reply_text(f"✅ Cleared target price for route {route_id}.")
+        await update.message.reply_text(
+            f"✅ Cleared target price for route {route_id}. "
+            "Scans stay silent until you set a new target."
+        )
         return
 
     if action == "target":
@@ -308,7 +314,8 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await db.set_route_alert(route_id, target_price=price)
         await update.message.reply_text(
-            f"✅ Route {route_id} will alert when price ≤ {price:g} {CURRENCY}."
+            f"✅ Route {route_id}: only notify when price ≤ {price:g} {CURRENCY}.\n"
+            "History keeps being saved on every scan."
         )
         return
 
@@ -323,7 +330,7 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await db.set_route_alert(route_id, alert_drop_pct=pct)
         await update.message.reply_text(
-            f"✅ Route {route_id} will alert on drops ≥ {pct:g}%."
+            f"✅ Route {route_id} will also alert on drops ≥ {pct:g}%."
         )
         return
 
@@ -340,8 +347,16 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔍 Scanning... this may take a moment.")
 
+    alerts_sent = 0
     for route in routes:
-        await _scan_and_send(context, route, use_lock=True)
+        sent = await _scan_and_send(context, route, use_lock=True)
+        if sent:
+            alerts_sent += 1
+
+    if alerts_sent == 0:
+        await update.message.reply_text(
+            f"✅ Scan done. Nenhuma rota no target ({len(routes)} verificada(s); histórico salvo)."
+        )
 
 
 async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -556,10 +571,8 @@ async def frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _should_send_summary() -> bool:
-    cfg = await db.get_config("always_send_summary")
-    if cfg is None:
-        return ALWAYS_SEND_SCAN_SUMMARY
-    return cfg != "0"
+    """Full scan summaries are off by default; enable with ALWAYS_SEND_SCAN_SUMMARY=1."""
+    return ALWAYS_SEND_SCAN_SUMMARY
 
 
 async def _scan_and_send(
@@ -567,15 +580,19 @@ async def _scan_and_send(
     route: dict,
     is_retry: bool = False,
     use_lock: bool = False,
-):
-    """Scan a single route, persist history/alerts, and notify."""
+) -> bool:
+    """Scan a single route, persist history/alerts, and notify on target.
+
+    Returns True if a deal/alert message was sent (not counting errors).
+    """
     from_code = route["from_airport"]
     to_code = route["to_airport"]
+    alert_sent = False
 
     if use_lock:
         scanning = context.bot_data.setdefault("_scanning_routes", set())
         if route["id"] in scanning:
-            return
+            return False
         scanning.add(route["id"])
 
     started = time.monotonic()
@@ -619,7 +636,6 @@ async def _scan_and_send(
                 from_code, to_code, retry_after, stay_days=stay_days
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-            # Schedule a single retry after the circuit cooldown (deduped)
             existing = context.job_queue.get_jobs_by_name(f"retry_{route['id']}")
             if not existing and not is_retry:
                 context.job_queue.run_once(
@@ -628,7 +644,7 @@ async def _scan_and_send(
                     data={"route_id": route["id"]},
                     name=f"retry_{route['id']}",
                 )
-            return
+            return False
 
         if result is NO_MATCHES:
             await db.create_scan_run(
@@ -646,7 +662,7 @@ async def _scan_and_send(
                 "Try a less restrictive stops preference via /stops or /routes."
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-            return
+            return False
 
         if result is None:
             await db.create_scan_run(
@@ -665,7 +681,6 @@ async def _scan_and_send(
                 if interval > 240:
                     msg = format_error_message(from_code, to_code, stay_days=stay_days)
                     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-                    # Deduplicate retry jobs
                     existing = context.job_queue.get_jobs_by_name(f"retry_{route['id']}")
                     if not existing:
                         context.job_queue.run_once(
@@ -681,7 +696,7 @@ async def _scan_and_send(
                         "Run /check to try manually."
                     )
                     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-            return
+            return False
 
         scan_run_id = await db.create_scan_run(
             route["id"],
@@ -767,9 +782,14 @@ async def _scan_and_send(
                 stats=stats_before if stats_before.get("count") else None,
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            alert_sent = True
         elif alert_lines:
             msg = format_alert_only_message(result, alert_lines, fx_amounts=fx_amounts)
             await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+            alert_sent = True
+        # else: silent — history already saved
+
+        return alert_sent
     finally:
         if use_lock:
             scanning = context.bot_data.get("_scanning_routes", set())

@@ -41,3 +41,19 @@ def test_invalid_currency_falls_back_to_brl(monkeypatch):
     config = _reload_config(monkeypatch, "JPY")
     assert config.CURRENCY == "BRL"
     assert config.COUNTRY == "BR"
+
+
+def test_always_send_scan_summary_defaults_off(monkeypatch):
+    monkeypatch.delenv("ALWAYS_SEND_SCAN_SUMMARY", raising=False)
+    import bot.config as config
+
+    config = importlib.reload(config)
+    assert config.ALWAYS_SEND_SCAN_SUMMARY is False
+
+
+def test_always_send_scan_summary_can_enable(monkeypatch):
+    monkeypatch.setenv("ALWAYS_SEND_SCAN_SUMMARY", "1")
+    import bot.config as config
+
+    config = importlib.reload(config)
+    assert config.ALWAYS_SEND_SCAN_SUMMARY is True

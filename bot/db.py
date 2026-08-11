@@ -129,7 +129,7 @@ class Database:
             INSERT OR IGNORE INTO config (key, value) VALUES ('is_paused', '0');
             INSERT OR IGNORE INTO config (key, value) VALUES ('stops_preference', 'any');
             INSERT OR IGNORE INTO config (key, value) VALUES ('scan_interval', '1440');
-            INSERT OR IGNORE INTO config (key, value) VALUES ('always_send_summary', '1');
+            INSERT OR IGNORE INTO config (key, value) VALUES ('always_send_summary', '0');
             """
         )
         await self.db.commit()
@@ -144,7 +144,7 @@ class Database:
                 "stay_days_max": "INTEGER DEFAULT NULL",
                 "target_price": "REAL DEFAULT NULL",
                 "alert_drop_pct": "REAL DEFAULT NULL",
-                "alert_on_new_low": "INTEGER DEFAULT 1",
+                "alert_on_new_low": "INTEGER DEFAULT 0",
                 "alert_cooldown_minutes": "INTEGER DEFAULT NULL",
             },
             "price_history": {

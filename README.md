@@ -71,9 +71,9 @@ Once the bot is running, message it on Telegram:
 /add ATQ BOM                 Add a one-way route
 /add VIX MXP 10              Round-trip with 10-day stay
 /add VIX,GIG MXP,BGY 7-10    Multi-airport + flexible stay
-/alert 1 target 2800         Alert when cheapest ≤ 2800
-/alert 1 drop 8              Alert on ≥8% drop vs last scan
-/check                       Scan all routes now
+/alert 1 target 2800         Notify only when cheapest ≤ 2800
+/alert 1 drop 8              Optional: also alert on ≥8% drop
+/check                       Scan now (silent unless target hit)
 /routes                      List saved routes
 /remove 1                    Remove route by ID
 /time 07:30                  Change scan start time
@@ -83,6 +83,7 @@ Once the bot is running, message it on Telegram:
 /help                        Show all commands
 ```
 
+By default the bot **does not** spam every scan. It keeps checking and saving history; Telegram messages go out when a route hits its `/alert … target` price (or on errors/rate-limits).
 ## Daily Message Example
 
 ```
@@ -129,8 +130,8 @@ Split-ticket deals (separate one-way fares cheaper than a round-trip package) ar
 | `STAY_SAMPLE_STEP` | No | `1` | Sample every N days in a stay range (use `2` for wide ranges) |
 | `TIMEZONE` | No | `Asia/Kolkata` | Timezone for scheduling |
 | `CURRENCY` | No | `BRL` | Primary currency (`BRL`, `USD`, `EUR`, `GBP`) |
-| `ALWAYS_SEND_SCAN_SUMMARY` | No | `1` | Send full summary every scan (`0` = alerts only) |
-| `DEFAULT_ALERT_DROP_PCT` | No | `5` | Default % drop alert threshold |
+| `ALWAYS_SEND_SCAN_SUMMARY` | No | `0` | `1` = full summary every scan; `0` = notify only on target/alerts |
+| `DEFAULT_ALERT_DROP_PCT` | No | `5` | Suggested % for `/alert <id> drop` (not auto-applied) |
 | `DEFAULT_ALERT_COOLDOWN_MINUTES` | No | `360` | Min minutes between alerts |
 | `FARE_PROVIDER` | No | `fli` | Fare provider (`fli` today; extension point) |
 | `DB_PATH` | No | `data/flights.db` | SQLite database path |
@@ -142,7 +143,7 @@ Split-ticket deals (separate one-way fares cheaper than a round-trip package) ar
 3. **Rate limiting** — global min-interval between Google calls, exponential backoff on HTTP 429, and a circuit breaker that pauses scans when Google keeps blocking.
 4. **Multi-currency display** — quotes are requested in `CURRENCY`; EUR/USD equivalents come from [Frankfurter](https://frankfurter.dev/) with SQLite cache.
 5. **Tracking** — each scan writes `scan_runs` + `fare_snapshots` (intraday history) and a daily `price_history` row for charts.
-6. **Alerts** — target price, % drop vs last scan, and new historical low, with cooldown + fingerprint dedupe.
+6. **Alerts** — by default silent; notify when `target_price` is hit (`/alert <id> target`). Optional drop % / new-low only if explicitly enabled on the route.
 
 There is **no official public Google Flights API**. Fli talks to Google’s unofficial internal endpoints and can break or be rate-limited. The bot wraps fares behind a `FareProvider` interface so a future paid/affiliate provider can be plugged in without rewriting handlers.
 

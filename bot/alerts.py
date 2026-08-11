@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from bot.config import (
     CURRENCY,
     DEFAULT_ALERT_COOLDOWN_MINUTES,
-    DEFAULT_ALERT_DROP_PCT,
 )
 
 
@@ -37,16 +36,14 @@ async def evaluate_alerts(
     stats: dict | None,
     currency: str = CURRENCY,
 ) -> list[AlertHit]:
-    """Return alert hits that should be sent (dedupe/cooldown applied by caller via db)."""
+    """Return alert hits that should be sent (dedupe/cooldown applied by caller via db).
+
+    Target-price is the primary rule. Drop % and new-low only fire when explicitly
+    configured on the route (no automatic defaults).
+    """
     hits: list[AlertHit] = []
     route_id = route["id"]
     cooldown = route.get("alert_cooldown_minutes") or DEFAULT_ALERT_COOLDOWN_MINUTES
-    drop_pct = route.get("alert_drop_pct")
-    if drop_pct is None:
-        drop_pct = DEFAULT_ALERT_DROP_PCT
-    alert_on_new_low = route.get("alert_on_new_low")
-    if alert_on_new_low is None:
-        alert_on_new_low = 1
 
     cooling = await db.is_alert_cooling_down(route_id, int(cooldown))
     if cooling:
@@ -63,7 +60,9 @@ async def evaluate_alerts(
             )
         )
 
-    if prev_price and prev_price > 0 and drop_pct is not None:
+    # Only when explicitly set on the route (not a global default)
+    drop_pct = route.get("alert_drop_pct")
+    if drop_pct is not None and prev_price and prev_price > 0:
         pct = ((price - prev_price) / prev_price) * 100
         if pct <= -float(drop_pct):
             hits.append(
@@ -75,15 +74,17 @@ async def evaluate_alerts(
                 )
             )
 
-    hist_min = (stats or {}).get("min")
-    if alert_on_new_low and hist_min is not None and price < float(hist_min):
-        hits.append(
-            AlertHit(
-                rule="new_low",
-                message=f"🏆 New historical low (was {hist_min:g} {currency})",
-                fingerprint=_fingerprint(route_id, "new_low", price, travel_date),
-                price=price,
+    # Only when explicitly enabled (default is off)
+    if route.get("alert_on_new_low") == 1:
+        hist_min = (stats or {}).get("min")
+        if hist_min is not None and price < float(hist_min):
+            hits.append(
+                AlertHit(
+                    rule="new_low",
+                    message=f"🏆 New historical low (was {hist_min:g} {currency})",
+                    fingerprint=_fingerprint(route_id, "new_low", price, travel_date),
+                    price=price,
+                )
             )
-        )
 
     return hits
