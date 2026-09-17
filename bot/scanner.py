@@ -185,12 +185,24 @@ def _parse_rt_search_result(flights):
     return first
 
 
-def _flight_details_from_result(flight) -> dict:
-    leg = flight.legs[0] if flight.legs else None
+def _flight_details_from_result(flight) -> dict | None:
+    if flight is None or getattr(flight, "price", None) is None:
+        return None
+    legs = getattr(flight, "legs", None) or []
+    leg = legs[0] if legs else None
+    airline = None
+    if leg is not None:
+        airline_obj = getattr(leg, "airline", None)
+        airline = getattr(airline_obj, "value", airline_obj)
+        if not airline:
+            airline = getattr(flight, "primary_airline_name", None)
+    departure = None
+    if leg is not None and getattr(leg, "departure_datetime", None):
+        departure = leg.departure_datetime.strftime("%I:%M %p")
     return {
         "price": flight.price,
-        "airline": leg.airline.value if leg else None,
-        "departure": leg.departure_datetime.strftime("%I:%M %p") if leg else None,
+        "airline": airline,
+        "departure": departure,
         "duration": flight.duration,
         "stops": flight.stops,
     }
@@ -206,6 +218,8 @@ def _cache_key(*parts) -> str:
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
+    if getattr(exc, "status_code", None) == 429:
+        return True
     text = f"{type(exc).__name__}: {exc}".lower()
     if "429" in text:
         return True
@@ -631,10 +645,7 @@ async def scan_flight_details(
     flights = await _cached_call(key, _call)
 
     if return_date:
-        flight = _parse_rt_search_result(flights)
-        if flight is None:
-            return None
-        return _flight_details_from_result(flight)
+        return _flight_details_from_result(_parse_rt_search_result(flights))
 
     if not flights:
         return None

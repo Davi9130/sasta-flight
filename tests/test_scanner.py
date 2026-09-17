@@ -174,6 +174,32 @@ async def test_scan_flight_details(mock_provider, cheapest_outbound_date):
 
 
 @pytest.mark.asyncio
+async def test_scan_flight_details_skips_missing_price(mock_provider, cheapest_outbound_date):
+    mock_provider.search_flights.return_value[0].price = None
+    travel_date = cheapest_outbound_date.strftime("%Y-%m-%d")
+    result = await scan_flight_details("ATQ", "BOM", travel_date, provider=mock_provider)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_provider_call_retries_on_typed_429(monkeypatch):
+    monkeypatch.setattr("bot.scanner.SEARCH_429_MAX_RETRIES", 2)
+    monkeypatch.setattr("bot.scanner.SEARCH_CIRCUIT_THRESHOLD", 99)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            err = RuntimeError("Google Flights returned an error")
+            err.status_code = 429
+            raise err
+        return "ok"
+
+    assert await _provider_call(flaky) == "ok"
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
 async def test_scan_route_dates_empty():
     provider = MagicMock()
     provider.name = "mock"
