@@ -8,7 +8,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Iterable
+from typing import Iterable, NoReturn
 
 from fli.models import (
     Airport,
@@ -38,6 +38,7 @@ from bot.config import (
     SEARCH_CIRCUIT_COOLDOWN_SECS,
     SEARCH_CIRCUIT_THRESHOLD,
     SEARCH_MIN_INTERVAL_SECS,
+    SEARCH_SILENT_BLOCK_COOLDOWN_SECS,
     SEARCH_TIMEOUT_SECS,
     STAY_SAMPLE_STEP,
     TOP_CHEAPEST,
@@ -66,6 +67,7 @@ _rate_lock = asyncio.Lock()
 _last_request_at = 0.0
 _consecutive_429 = 0
 _circuit_open_until = 0.0
+_circuit_reason: str | None = None
 
 
 class RateLimitPaused(Exception):
@@ -217,11 +219,20 @@ def _cache_key(*parts) -> str:
     return "|".join(str(p) for p in parts)
 
 
+def _payload_label(result) -> str:
+    if result is None:
+        return "None"
+    if isinstance(result, (list, tuple)):
+        return f"{type(result).__name__}[{len(result)}]"
+    return type(result).__name__
+
+
 def _is_rate_limit_error(exc: BaseException) -> bool:
-    if getattr(exc, "status_code", None) == 429:
+    status = getattr(exc, "status_code", None)
+    if status in {401, 403, 429, 503}:
         return True
     text = f"{type(exc).__name__}: {exc}".lower()
-    if "429" in text:
+    if any(token in text for token in ("429", "403", "401", "captcha", "forbidden")):
         return True
     if "rate" in text and ("limit" in text or "blocked" in text):
         return True
@@ -240,12 +251,57 @@ def is_circuit_open() -> bool:
     return circuit_retry_after_secs() > 0
 
 
+def get_circuit_reason() -> str | None:
+    """Why the circuit is open: http_429 | silent_empty_calendar | http_block, or None."""
+    if not is_circuit_open():
+        return None
+    return _circuit_reason
+
+
 def reset_rate_limiter():
     """Test helper: clear limiter / circuit state."""
-    global _last_request_at, _consecutive_429, _circuit_open_until
+    global _last_request_at, _consecutive_429, _circuit_open_until, _circuit_reason
     _last_request_at = 0.0
     _consecutive_429 = 0
     _circuit_open_until = 0.0
+    _circuit_reason = None
+
+
+def _open_circuit(reason: str, cooldown_secs: float) -> None:
+    global _circuit_open_until, _circuit_reason
+    _circuit_reason = reason
+    _circuit_open_until = time.monotonic() + cooldown_secs
+    logger.error(
+        "Circuit OPEN reason=%s cooldown=%.0fs",
+        reason,
+        cooldown_secs,
+    )
+
+
+def _mark_silent_block(reason: str) -> float:
+    """Treat empty calendar/payload as a soft Google block. Returns cooldown secs."""
+    if is_circuit_open():
+        remaining = circuit_retry_after_secs()
+        logger.warning(
+            "SILENT_BLOCK (circuit already open reason=%s retry_after=%.0fs): %s",
+            _circuit_reason,
+            remaining,
+            reason,
+        )
+        return remaining
+    cooldown = SEARCH_SILENT_BLOCK_COOLDOWN_SECS
+    logger.error(
+        "SILENT_BLOCK detected: %s — empty payload without HTTP 429; pausing %.0fs",
+        reason,
+        cooldown,
+    )
+    _open_circuit("silent_empty_calendar", cooldown)
+    return cooldown
+
+
+def _raise_silent_block(reason: str) -> NoReturn:
+    cooldown = _mark_silent_block(reason)
+    raise RateLimitPaused(cooldown)
 
 
 def _sample_stay_values(stay_min: int, stay_max: int) -> list[int]:
@@ -286,17 +342,17 @@ def _note_success():
 
 def _note_429() -> float:
     """Record a 429 and possibly open the circuit. Returns backoff delay secs."""
-    global _consecutive_429, _circuit_open_until
+    global _consecutive_429
     _consecutive_429 += 1
     attempt = min(_consecutive_429, SEARCH_429_MAX_RETRIES)
     delay = SEARCH_429_BASE_DELAY_SECS * (2 ** (attempt - 1))
     delay *= 0.8 + random.random() * 0.4  # jitter
     if _consecutive_429 >= SEARCH_CIRCUIT_THRESHOLD:
-        _circuit_open_until = time.monotonic() + SEARCH_CIRCUIT_COOLDOWN_SECS
+        _open_circuit("http_429", SEARCH_CIRCUIT_COOLDOWN_SECS)
         logger.warning(
-            "Rate-limit circuit OPEN for %.0fs after %d consecutive 429s",
-            SEARCH_CIRCUIT_COOLDOWN_SECS,
+            "HTTP 429 threshold reached (%d consecutive); circuit cooldown %.0fs",
             _consecutive_429,
+            SEARCH_CIRCUIT_COOLDOWN_SECS,
         )
     return delay
 
@@ -311,11 +367,28 @@ async def _provider_call(func, *args, **kwargs):
                 asyncio.to_thread(func, *args, **kwargs),
                 timeout=SEARCH_TIMEOUT_SECS,
             )
+            if result is None or result == []:
+                logger.warning(
+                    "Provider returned empty payload fn=%s payload=%s",
+                    getattr(func, "__name__", func),
+                    _payload_label(result),
+                )
+                return result
             _note_success()
             return result
         except RateLimitPaused:
             raise
         except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            logger.warning(
+                "Provider call failed fn=%s type=%s status=%s err=%s",
+                getattr(func, "__name__", func),
+                type(exc).__name__,
+                status,
+                exc,
+            )
+            if status in {401, 403, 503} and not is_circuit_open():
+                _open_circuit("http_block", SEARCH_SILENT_BLOCK_COOLDOWN_SECS)
             if not _is_rate_limit_error(exc):
                 raise
             last_exc = exc
@@ -376,6 +449,14 @@ async def _scan_oneway_dates_window(
 
     results = await _cached_call(key, _call)
     if not results:
+        logger.warning(
+            "SearchDates empty trip=OW %s->%s window=%s..%s payload=%s",
+            from_code,
+            to_code,
+            start.strftime("%Y-%m-%d"),
+            end.strftime("%Y-%m-%d"),
+            _payload_label(results),
+        )
         return []
 
     date_prices = []
@@ -388,6 +469,14 @@ async def _scan_oneway_dates_window(
                 "to_airport": to_code,
             }
         )
+    logger.info(
+        "SearchDates OW %s->%s window=%s..%s days=%d",
+        from_code,
+        to_code,
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+        len(date_prices),
+    )
     return sorted(date_prices, key=lambda x: x["price"])
 
 
@@ -424,6 +513,15 @@ async def _scan_roundtrip_dates_window(
 
     results = await _cached_call(key, _call)
     if not results:
+        logger.warning(
+            "SearchDates empty trip=RT %s->%s stay=%sd window=%s..%s payload=%s",
+            from_code,
+            to_code,
+            stay_days,
+            start.strftime("%Y-%m-%d"),
+            end.strftime("%Y-%m-%d"),
+            _payload_label(results),
+        )
         return []
 
     date_prices = []
@@ -479,29 +577,6 @@ async def _scan_dates_chunked(
     return sorted(merged, key=lambda x: x["price"])
 
 
-def _generate_outbound_dates(
-    start: datetime,
-    end: datetime,
-    stay_days: int | None = None,
-    from_code: str | None = None,
-    to_code: str | None = None,
-) -> list[dict]:
-    dates = []
-    current = start
-    while current <= end:
-        entry = {"date": current.strftime("%Y-%m-%d")}
-        if stay_days:
-            entry["return_date"] = _return_date(entry["date"], stay_days)
-            entry["stay_days"] = stay_days
-        if from_code:
-            entry["from_airport"] = from_code
-        if to_code:
-            entry["to_airport"] = to_code
-        dates.append(entry)
-        current += timedelta(days=1)
-    return dates
-
-
 async def scan_route_dates(
     from_code: str,
     to_code: str,
@@ -512,7 +587,7 @@ async def scan_route_dates(
     currency: str = CURRENCY,
     country: str = COUNTRY,
 ) -> list[dict]:
-    """Get prices for the next N days. Returns list sorted by price."""
+    """Get prices for the next N days. Empty calendar is a silent block, not fake dates."""
     provider = provider or get_fare_provider()
     tomorrow = datetime.now() + timedelta(days=1)
     end_date = tomorrow + timedelta(days=days)
@@ -531,7 +606,7 @@ async def scan_route_dates(
         if date_prices:
             return date_prices
         logger.warning(
-            "Round-trip calendar empty for %s -> %s (%sd), trying outbound calendar",
+            "Round-trip calendar empty for %s -> %s (%sd); trying outbound calendar once",
             from_code,
             to_code,
             stay_days,
@@ -547,17 +622,20 @@ async def scan_route_dates(
             country=country,
         )
         if oneway_prices:
+            logger.info(
+                "Using outbound calendar as RT proxy for %s -> %s (%sd); %d days",
+                from_code,
+                to_code,
+                stay_days,
+                len(oneway_prices),
+            )
             for day in oneway_prices:
                 day["return_date"] = _return_date(day["date"], stay_days)
                 day["stay_days"] = stay_days
             return oneway_prices
-        logger.warning(
-            "Outbound calendar also empty for %s -> %s (%sd), using generated dates",
-            from_code,
-            to_code,
-            stay_days,
+        _raise_silent_block(
+            f"empty calendar RT+OW {from_code}->{to_code} stay={stay_days}d"
         )
-        return _generate_outbound_dates(tomorrow, end_date, stay_days, from_code, to_code)
 
     oneway_prices = await _scan_dates_chunked(
         provider=provider,
@@ -571,12 +649,7 @@ async def scan_route_dates(
     )
     if oneway_prices:
         return oneway_prices
-    logger.warning(
-        "Calendar empty for %s -> %s, using generated outbound dates",
-        from_code,
-        to_code,
-    )
-    return _generate_outbound_dates(tomorrow, end_date, from_code=from_code, to_code=to_code)
+    _raise_silent_block(f"empty calendar OW {from_code}->{to_code}")
 
 
 # Back-compat aliases used by older tests
@@ -644,11 +717,31 @@ async def scan_flight_details(
 
     flights = await _cached_call(key, _call)
 
-    if return_date:
-        return _flight_details_from_result(_parse_rt_search_result(flights))
-
     if not flights:
+        logger.warning(
+            "SearchFlights empty %s->%s date=%s return=%s stops=%s payload=%s",
+            from_code,
+            to_code,
+            travel_date,
+            return_date,
+            max_stops,
+            _payload_label(flights),
+        )
         return None
+
+    if return_date:
+        details = _flight_details_from_result(_parse_rt_search_result(flights))
+        if details is None:
+            logger.warning(
+                "SearchFlights RT parsed empty %s->%s date=%s return=%s payload=%s",
+                from_code,
+                to_code,
+                travel_date,
+                return_date,
+                _payload_label(flights),
+            )
+        return details
+
     return _flight_details_from_result(flights[0])
 
 
@@ -966,8 +1059,13 @@ async def scan_route(
         return None
 
     if not candidates:
-        logger.warning("No prices found for %s -> %s", from_airports, to_airports)
-        return None
+        logger.error(
+            "SILENT_BLOCK no calendar candidates for %s -> %s after collection",
+            from_airports,
+            to_airports,
+        )
+        _mark_silent_block(f"no calendar candidates {from_airports}->{to_airports}")
+        return RATE_LIMITED
 
     pool = candidates[: max(candidate_pool, TOP_CHEAPEST)]
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
@@ -997,7 +1095,19 @@ async def scan_route(
     if not deals:
         if rate_limited or is_circuit_open():
             return RATE_LIMITED
-        logger.warning("No flights matching stops preference for %s -> %s", from_airports, to_airports)
+        if max_stops == "any":
+            _mark_silent_block(
+                f"all {len(pool)} detail confirms empty with stops=any "
+                f"{from_airports}->{to_airports}"
+            )
+            return RATE_LIMITED
+        logger.warning(
+            "No flights matching stops preference=%s for %s -> %s (checked %d candidates)",
+            max_stops,
+            from_airports,
+            to_airports,
+            len(pool),
+        )
         return NO_MATCHES
 
     try:

@@ -366,6 +366,7 @@ def format_rate_limited_message(
     to_airport: str,
     retry_after_secs: float,
     stay_days: int | None = None,
+    reason: str | None = None,
 ) -> str:
     route_label = (
         f"{from_airport} ⇄ {to_airport} ({stay_days} days)"
@@ -373,6 +374,18 @@ def format_rate_limited_message(
         else f"{from_airport} → {to_airport}"
     )
     minutes = max(1, int((retry_after_secs + 59) // 60))
+    if reason in {"silent_empty_calendar", "http_block"}:
+        kind = (
+            "empty calendars (silent block, no HTTP 429)"
+            if reason == "silent_empty_calendar"
+            else "HTTP 401/403/503"
+        )
+        return (
+            f"⏳ {route_label}\n"
+            f"Google Flights blocked this server: {kind}.\n"
+            f"Pausing scans for ~{minutes} min to protect this IP.\n"
+            "Do not run /check until then."
+        )
     return (
         f"⏳ {route_label}\n"
         "Google Flights rate-limited this server (HTTP 429).\n"

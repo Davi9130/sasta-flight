@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta
 
 from bot.scanner import (
+    NO_MATCHES,
     RATE_LIMITED,
     RateLimitPaused,
     ScanResult,
@@ -11,6 +12,7 @@ from bot.scanner import (
     _sample_stay_values,
     clear_search_cache,
     circuit_retry_after_secs,
+    get_circuit_reason,
     is_circuit_open,
     parse_airport_list,
     parse_stay_range,
@@ -147,14 +149,73 @@ async def test_scan_route_roundtrip(mock_date_results, mock_flight_results, chea
 
 
 @pytest.mark.asyncio
-async def test_scan_route_dates_fallback_generates_dates():
-    tomorrow = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+async def test_scan_route_dates_empty_calendar_is_silent_block():
     with patch("bot.scanner._scan_dates_chunked", return_value=[]):
-        result = await scan_route_dates("VIX", "MXP", days=2, stay_days=10)
+        with pytest.raises(RateLimitPaused):
+            await scan_route_dates("VIX", "MXP", days=2, stay_days=10)
 
-    assert len(result) == 3
-    assert result[0]["return_date"] == (tomorrow + timedelta(days=10)).strftime("%Y-%m-%d")
-    assert "price" not in result[0]
+    assert is_circuit_open()
+    assert get_circuit_reason() == "silent_empty_calendar"
+
+
+@pytest.mark.asyncio
+async def test_scan_route_dates_empty():
+    provider = MagicMock()
+    provider.name = "mock"
+    provider.search_dates.return_value = []
+    with pytest.raises(RateLimitPaused):
+        await scan_route_dates("ATQ", "BOM", days=7, provider=provider)
+    assert is_circuit_open()
+    assert get_circuit_reason() == "silent_empty_calendar"
+
+
+@pytest.mark.asyncio
+async def test_scan_route_empty_calendar_aborts_stay_range():
+    provider = MagicMock()
+    provider.name = "mock"
+    provider.search_dates.return_value = []
+    result = await scan_route(
+        "VIX", "FCO", stay_days=7, stay_days_max=12, provider=provider
+    )
+    assert result is RATE_LIMITED
+    assert get_circuit_reason() == "silent_empty_calendar"
+    # RT + OW for the first stay only — do not walk 7/9/11/12
+    assert provider.search_dates.call_count <= 2
+
+
+@pytest.mark.asyncio
+async def test_scan_route_all_details_empty_any_stops_is_silent_block(mock_date_results):
+    provider = MagicMock()
+    provider.name = "mock"
+    provider.search_dates.return_value = mock_date_results
+    provider.search_flights.return_value = []
+    result = await scan_route("ATQ", "BOM", max_stops="any", provider=provider)
+    assert result is RATE_LIMITED
+    assert get_circuit_reason() == "silent_empty_calendar"
+
+
+@pytest.mark.asyncio
+async def test_scan_route_all_details_empty_direct_is_no_matches(mock_date_results):
+    provider = MagicMock()
+    provider.name = "mock"
+    provider.search_dates.return_value = mock_date_results
+    provider.search_flights.return_value = []
+    result = await scan_route("ATQ", "BOM", max_stops="direct", provider=provider)
+    assert result is NO_MATCHES
+    assert not is_circuit_open()
+
+
+@pytest.mark.asyncio
+async def test_provider_call_403_opens_circuit():
+    def forbidden():
+        err = RuntimeError("forbidden")
+        err.status_code = 403
+        raise err
+
+    with pytest.raises((RuntimeError, RateLimitPaused)):
+        await _provider_call(forbidden)
+    assert is_circuit_open()
+    assert get_circuit_reason() == "http_block"
 
 
 @pytest.mark.asyncio
@@ -197,16 +258,6 @@ async def test_provider_call_retries_on_typed_429(monkeypatch):
 
     assert await _provider_call(flaky) == "ok"
     assert calls["n"] == 2
-
-
-@pytest.mark.asyncio
-async def test_scan_route_dates_empty():
-    provider = MagicMock()
-    provider.name = "mock"
-    provider.search_dates.return_value = []
-    result = await scan_route_dates("ATQ", "BOM", days=7, provider=provider)
-    assert len(result) == 8
-    assert "price" not in result[0]
 
 
 @pytest.mark.asyncio

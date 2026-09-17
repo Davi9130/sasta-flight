@@ -33,6 +33,8 @@ from bot.scanner import (
     NO_MATCHES,
     RATE_LIMITED,
     circuit_retry_after_secs,
+    get_circuit_reason,
+    is_circuit_open,
     parse_airport_list,
     parse_stay_range,
     scan_route,
@@ -597,6 +599,17 @@ async def _scan_and_send(
 
     started = time.monotonic()
     try:
+        if is_circuit_open():
+            logger.warning(
+                "Skipping scan route_id=%s %s->%s; circuit open reason=%s retry_after=%.0fs",
+                route["id"],
+                from_code,
+                to_code,
+                get_circuit_reason(),
+                circuit_retry_after_secs(),
+            )
+            return False
+
         max_stops = await db.get_route_stops_preference(route["id"])
         stay_days = route.get("stay_days")
         stay_days_max = route.get("stay_days_max")
@@ -623,17 +636,23 @@ async def _scan_and_send(
 
         if result is RATE_LIMITED:
             retry_after = circuit_retry_after_secs() or 300
+            reason = get_circuit_reason() or "http_429"
+            status = "source_blocked" if reason != "http_429" else "rate_limited"
             await db.create_scan_run(
                 route["id"],
-                "rate_limited",
+                status,
                 provider="fli",
                 currency=CURRENCY,
                 duration_ms=duration_ms,
-                error=f"HTTP 429 / circuit open; retry_after={retry_after:.0f}s",
+                error=f"{reason}; retry_after={retry_after:.0f}s",
                 filters_json=json.dumps({"max_stops": max_stops}),
             )
             msg = format_rate_limited_message(
-                from_code, to_code, retry_after, stay_days=stay_days
+                from_code,
+                to_code,
+                retry_after,
+                stay_days=stay_days,
+                reason=reason,
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg)
             existing = context.job_queue.get_jobs_by_name(f"retry_{route['id']}")

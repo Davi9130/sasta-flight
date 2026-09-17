@@ -162,6 +162,53 @@ async def test_scan_and_send_rate_limited_message():
 
 
 @pytest.mark.asyncio
+async def test_scan_and_send_skips_when_circuit_open():
+    from bot.handlers import _scan_and_send
+
+    route = {"id": 1, "from_airport": "VIX", "to_airport": "FCO"}
+    mock_context = MagicMock()
+    mock_context.bot.send_message = AsyncMock()
+    mock_context.bot_data = {}
+
+    with patch("bot.handlers.is_circuit_open", return_value=True), patch(
+        "bot.handlers.get_circuit_reason", return_value="silent_empty_calendar"
+    ), patch("bot.handlers.circuit_retry_after_secs", return_value=3600), patch(
+        "bot.handlers.scan_route", new_callable=AsyncMock
+    ) as mock_scan:
+        await _scan_and_send(mock_context, route)
+        mock_scan.assert_not_called()
+        mock_context.bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scan_and_send_silent_block_message():
+    from bot.handlers import _scan_and_send
+    from bot.scanner import RATE_LIMITED
+
+    route = {"id": 1, "from_airport": "VIX", "to_airport": "FCO", "stay_days": 7}
+    mock_context = MagicMock()
+    mock_context.bot.send_message = AsyncMock()
+    mock_context.job_queue.get_jobs_by_name = MagicMock(return_value=[])
+    mock_context.job_queue.run_once = MagicMock()
+    mock_context.bot_data = {}
+
+    with patch("bot.handlers.db") as mock_db, patch(
+        "bot.handlers.scan_route", new_callable=AsyncMock, return_value=RATE_LIMITED
+    ), patch("bot.handlers.circuit_retry_after_secs", return_value=3600), patch(
+        "bot.handlers.get_circuit_reason", return_value="silent_empty_calendar"
+    ), patch("bot.handlers.is_circuit_open", return_value=False):
+        mock_db.get_route_stops_preference = AsyncMock(return_value="any")
+        mock_db.get_previous_cheapest = AsyncMock(return_value=None)
+        mock_db.get_route_price_stats = AsyncMock(return_value={"count": 0})
+        mock_db.create_scan_run = AsyncMock(return_value=1)
+        await _scan_and_send(mock_context, route)
+        assert mock_db.create_scan_run.call_args[0][1] == "source_blocked"
+        sent = mock_context.bot.send_message.call_args
+        text = sent.kwargs.get("text") or (sent.args[1] if len(sent.args) > 1 else "")
+        assert "silent" in text.lower()
+
+
+@pytest.mark.asyncio
 async def test_scan_and_send_persists_snapshots_and_alerts():
     from bot.handlers import _scan_and_send
     from bot.alerts import AlertHit
