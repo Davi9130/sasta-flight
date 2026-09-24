@@ -30,6 +30,7 @@ from bot.config import (
     CURRENCY,
     DAYS_TO_SCAN,
     ENABLE_SPLIT_TICKETS,
+    HUB_CONFIRM_POOL,
     MAX_AIRPORT_COMBOS,
     MAX_CONCURRENT_SEARCHES,
     SEARCH_429_BASE_DELAY_SECS,
@@ -122,6 +123,10 @@ class ScanResult:
     outbound_price: float | None = None
     inbound_price: float | None = None
     candidates_checked: int = 0
+    direct_price: float | None = None
+    hub_nights: int | None = None
+    hub_nights_max: int | None = None
+    via_combos: list[dict] = field(default_factory=list)
 
 
 def parse_airport_list(value: str | Iterable[str]) -> list[str]:
@@ -192,6 +197,7 @@ def _flight_details_from_result(flight) -> dict | None:
         return None
     legs = getattr(flight, "legs", None) or []
     leg = legs[0] if legs else None
+    last = legs[-1] if legs else None
     airline = None
     if leg is not None:
         airline_obj = getattr(leg, "airline", None)
@@ -199,12 +205,16 @@ def _flight_details_from_result(flight) -> dict | None:
         if not airline:
             airline = getattr(flight, "primary_airline_name", None)
     departure = None
-    if leg is not None and getattr(leg, "departure_datetime", None):
-        departure = leg.departure_datetime.strftime("%I:%M %p")
+    departure_at = getattr(leg, "departure_datetime", None) if leg is not None else None
+    arrival_at = getattr(last, "arrival_datetime", None) if last is not None else None
+    if departure_at:
+        departure = departure_at.strftime("%I:%M %p")
     return {
         "price": flight.price,
         "airline": airline,
         "departure": departure,
+        "departure_at": departure_at,
+        "arrival_at": arrival_at,
         "duration": flight.duration,
         "stops": flight.stops,
     }
@@ -1154,6 +1164,295 @@ async def scan_route(
         outbound_price=best.outbound_price,
         inbound_price=best.inbound_price,
         candidates_checked=len(pool),
+    )
+
+
+def _quotes_from_days(days: list[dict]) -> list:
+    from bot.hubs import LegQuote
+
+    quotes = []
+    for day in days:
+        if day.get("price") is None or not day.get("date"):
+            continue
+        quotes.append(
+            LegQuote(
+                date=day["date"],
+                price=float(day["price"]),
+                from_airport=day.get("from_airport") or "",
+                to_airport=day.get("to_airport") or "",
+            )
+        )
+    return quotes
+
+
+async def _calendar_quotes(provider, pairs, start, end, currency, country) -> list:
+    quotes = []
+    for from_code, to_code in pairs:
+        if is_circuit_open():
+            raise RateLimitPaused(circuit_retry_after_secs() or SEARCH_CIRCUIT_COOLDOWN_SECS)
+        try:
+            days = await _scan_dates_chunked(
+                provider=provider,
+                from_code=from_code,
+                to_code=to_code,
+                start=start,
+                end=end,
+                stay_days=None,
+                currency=currency,
+                country=country,
+            )
+        except RateLimitPaused:
+            raise
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                raise RateLimitPaused(
+                    circuit_retry_after_secs() or SEARCH_CIRCUIT_COOLDOWN_SECS
+                ) from exc
+            logger.warning("Via calendar failed %s->%s: %s", from_code, to_code, exc)
+            continue
+        for day in days:
+            day.setdefault("from_airport", from_code)
+            day.setdefault("to_airport", to_code)
+        quotes.extend(_quotes_from_days(days))
+    return quotes
+
+
+def _leg_dict(quote, details: dict | None) -> dict:
+    data = {
+        "date": quote.date,
+        "price": details["price"] if details else quote.price,
+        "from_airport": quote.from_airport,
+        "to_airport": quote.to_airport,
+        "airline": (details or {}).get("airline"),
+        "departure": (details or {}).get("departure"),
+        "duration": (details or {}).get("duration"),
+        "stops": (details or {}).get("stops"),
+        "fare_type": "oneway",
+    }
+    return data
+
+
+async def _confirm_leg(quote, max_stops, provider, currency, country, semaphore):
+    async with semaphore:
+        return await scan_flight_details(
+            quote.from_airport,
+            quote.to_airport,
+            quote.date,
+            max_stops=max_stops,
+            provider=provider,
+            currency=currency,
+            country=country,
+        )
+
+
+def _combo_to_day(combo, legs: list[dict], total: float) -> dict:
+    return {
+        "date": combo.long_out.date,
+        "return_date": combo.long_in.date,
+        "price": total,
+        "from_airport": combo.pos_out.from_airport,
+        "to_airport": combo.long_out.to_airport,
+        "fare_type": "via_hub",
+        "airline": legs[1].get("airline") if len(legs) > 1 else None,
+        "nights_out": combo.nights_out,
+        "nights_back": combo.nights_back,
+        "dest_stay": combo.dest_stay,
+        "hub_out": combo.hub_out_city,
+        "hub_back": combo.hub_back_city,
+        "legs": legs,
+    }
+
+
+async def scan_via_route(
+    from_code: str | list[str],
+    to_code: str | list[str],
+    stay_days: int,
+    stay_days_max: int | None = None,
+    hub_nights: int = 0,
+    hub_nights_max: int | None = None,
+    max_stops: str = "any",
+    *,
+    days: int = DAYS_TO_SCAN,
+    provider: FareProvider | None = None,
+    currency: str = CURRENCY,
+    country: str = COUNTRY,
+    confirm_pool: int = HUB_CONFIRM_POOL,
+) -> ScanResult | str | None:
+    """Join origin→hub→dest and dest→hub→origin, then confirm the cheapest totals."""
+    from bot.hubs import connection_ok, join_hub_itineraries, longhaul_airports, positioning_airports
+
+    if is_circuit_open():
+        return RATE_LIMITED
+
+    provider = provider or get_fare_provider()
+    origins = parse_airport_list(from_code)
+    destinations = parse_airport_list(to_code)
+    if not origins or not destinations:
+        return None
+
+    stay_min = stay_days
+    stay_max = stay_days_max if stay_days_max is not None else stay_days
+    nights_min = hub_nights
+    nights_max = hub_nights_max if hub_nights_max is not None else hub_nights
+
+    tomorrow = datetime.now() + timedelta(days=1)
+    end_date = tomorrow + timedelta(days=days + nights_max + stay_max + nights_max)
+    pos_airports = positioning_airports()
+    long_airports = longhaul_airports()
+
+    try:
+        pos_out = await _calendar_quotes(
+            provider,
+            _airport_pairs(origins, pos_airports),
+            tomorrow,
+            tomorrow + timedelta(days=days),
+            currency,
+            country,
+        )
+        long_out = await _calendar_quotes(
+            provider,
+            _airport_pairs(long_airports, destinations),
+            tomorrow,
+            tomorrow + timedelta(days=days + nights_max),
+            currency,
+            country,
+        )
+        long_in = await _calendar_quotes(
+            provider,
+            _airport_pairs(destinations, long_airports),
+            tomorrow + timedelta(days=stay_min),
+            end_date,
+            currency,
+            country,
+        )
+        pos_in = await _calendar_quotes(
+            provider,
+            _airport_pairs(pos_airports, origins),
+            tomorrow + timedelta(days=stay_min),
+            end_date,
+            currency,
+            country,
+        )
+    except RateLimitPaused:
+        return RATE_LIMITED
+    except Exception:
+        logger.exception("Via calendar scan failed %s -> %s", origins, destinations)
+        return None
+
+    combos = join_hub_itineraries(
+        pos_out,
+        long_out,
+        long_in,
+        pos_in,
+        dest_stay_min=stay_min,
+        dest_stay_max=stay_max,
+        hub_nights_min=nights_min,
+        hub_nights_max=nights_max,
+    )
+    if not combos:
+        logger.warning("No via-hub calendar combos for %s -> %s", origins, destinations)
+        return NO_MATCHES
+
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
+    confirmed_days: list[dict] = []
+    rate_limited = False
+    for combo in combos[: max(confirm_pool, 1)]:
+        quotes = (combo.pos_out, combo.long_out, combo.long_in, combo.pos_in)
+        details = []
+        try:
+            for quote in quotes:
+                details.append(
+                    await _confirm_leg(
+                        quote, max_stops, provider, currency, country, semaphore
+                    )
+                )
+        except RateLimitPaused:
+            rate_limited = True
+            break
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                rate_limited = True
+                break
+            logger.warning("Via confirm failed: %s", exc)
+            continue
+        if any(item is None for item in details):
+            continue
+        if not connection_ok(
+            details[0].get("arrival_at"),
+            details[1].get("departure_at"),
+            combo.nights_out,
+        ):
+            continue
+        if not connection_ok(
+            details[2].get("arrival_at"),
+            details[3].get("departure_at"),
+            combo.nights_back,
+        ):
+            continue
+        legs = [_leg_dict(quote, item) for quote, item in zip(quotes, details)]
+        total = sum(leg["price"] for leg in legs)
+        confirmed_days.append(_combo_to_day(combo, legs, total))
+
+    if not confirmed_days:
+        if rate_limited or is_circuit_open():
+            return RATE_LIMITED
+        return NO_MATCHES
+
+    confirmed_days.sort(key=lambda day: day["price"])
+    top = confirmed_days[:TOP_CHEAPEST]
+    prices = [day["price"] for day in confirmed_days]
+    best = top[0]
+
+    direct_price = None
+    if not is_circuit_open():
+        try:
+            direct = await scan_route(
+                origins,
+                destinations,
+                max_stops=max_stops,
+                stay_days=stay_min,
+                stay_days_max=stay_max,
+                days=days,
+                provider=provider,
+                currency=currency,
+                country=country,
+                candidate_pool=min(CANDIDATE_POOL, 3),
+            )
+            if isinstance(direct, ScanResult):
+                direct_price = direct.cheapest_price
+        except RateLimitPaused:
+            pass
+        except Exception:
+            logger.warning("Direct comparison failed for %s -> %s", origins, destinations)
+
+    return ScanResult(
+        from_airport=",".join(origins),
+        to_airport=",".join(destinations),
+        from_airports=origins,
+        to_airports=destinations,
+        cheapest_price=best["price"],
+        cheapest_travel_date=best["date"],
+        cheapest_return_date=best.get("return_date"),
+        cheapest_airline=best.get("airline"),
+        cheapest_departure=None,
+        cheapest_duration=None,
+        cheapest_stops=None,
+        cheapest_from=best.get("from_airport"),
+        cheapest_to=best.get("to_airport"),
+        top_days=top,
+        avg_price=sum(prices) / len(prices),
+        min_price=min(prices),
+        max_price=max(prices),
+        stay_days=stay_min,
+        stay_days_max=stay_max if stay_max != stay_min else None,
+        currency=currency,
+        provider=provider.name,
+        fare_type="via_hub",
+        candidates_checked=min(len(combos), confirm_pool),
+        direct_price=direct_price,
+        hub_nights=nights_min,
+        hub_nights_max=nights_max if nights_max != nights_min else None,
+        via_combos=top,
     )
 
 

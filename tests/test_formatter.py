@@ -5,6 +5,7 @@ from bot.formatter import (
     _format_price_multi,
     format_daily_message,
     format_history_message,
+    format_via_message,
 )
 from bot.scanner import ScanResult
 
@@ -286,6 +287,67 @@ def test_format_daily_message_split_tickets():
     assert "Separate tickets" in msg
     assert "[Out →]" in msg
     assert "[Return →]" in msg
+
+
+def test_format_via_message_lists_legs_and_savings():
+    leg = lambda origin, dest, price: {
+        "date": "2026-04-02" if origin != "VIX" else "2026-04-01",
+        "price": price,
+        "from_airport": origin,
+        "to_airport": dest,
+        "airline": "GOL",
+        "fare_type": "oneway",
+    }
+    legs = [
+        {**leg("VIX", "CGH", 200), "date": "2026-04-01"},
+        {**leg("GRU", "MXP", 900), "date": "2026-04-02", "airline": "LATAM"},
+        {**leg("MXP", "GIG", 800), "date": "2026-04-12"},
+        {**leg("SDU", "VIX", 180), "date": "2026-04-13"},
+    ]
+    combo = {
+        "date": "2026-04-02",
+        "return_date": "2026-04-12",
+        "price": 2080,
+        "from_airport": "VIX",
+        "to_airport": "MXP",
+        "fare_type": "via_hub",
+        "nights_out": 1,
+        "nights_back": 1,
+        "hub_out": "SAO",
+        "hub_back": "RIO",
+        "legs": legs,
+    }
+    result = ScanResult(
+        from_airport="VIX",
+        to_airport="MXP",
+        cheapest_price=2080,
+        cheapest_travel_date="2026-04-02",
+        cheapest_airline="LATAM",
+        cheapest_departure=None,
+        cheapest_duration=None,
+        cheapest_stops=None,
+        top_days=[combo],
+        avg_price=2080,
+        min_price=2080,
+        max_price=2080,
+        stay_days=10,
+        currency="BRL",
+        fare_type="via_hub",
+        from_airports=["VIX"],
+        to_airports=["MXP"],
+        direct_price=5200,
+        hub_nights=0,
+        hub_nights_max=2,
+        via_combos=[combo],
+    )
+    msg = format_via_message(result)
+    assert "via SP/RJ" in msg
+    assert "R$2,080" in msg
+    assert "R$5,200" in msg
+    assert "VIX→CGH" in msg
+    assert "GRU→MXP" in msg
+    assert "Passagens separadas" in msg
+    assert "[Book →]" in msg
 
 
 @pytest.mark.parametrize(

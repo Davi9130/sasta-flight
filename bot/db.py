@@ -146,6 +146,9 @@ class Database:
                 "alert_drop_pct": "REAL DEFAULT NULL",
                 "alert_on_new_low": "INTEGER DEFAULT 0",
                 "alert_cooldown_minutes": "INTEGER DEFAULT NULL",
+                "via_hub": "INTEGER DEFAULT 0",
+                "hub_nights": "INTEGER DEFAULT NULL",
+                "hub_nights_max": "INTEGER DEFAULT NULL",
             },
             "price_history": {
                 "cheapest_return_date": "TEXT DEFAULT NULL",
@@ -194,17 +197,24 @@ class Database:
         max_stops: str | None = None,
         stay_days: int | None = None,
         stay_days_max: int | None = None,
+        via_hub: int = 0,
+        hub_nights: int | None = None,
+        hub_nights_max: int | None = None,
     ) -> int:
         cursor = await self.db.execute(
             """INSERT INTO routes
-            (from_airport, to_airport, max_stops, stay_days, stay_days_max)
-            VALUES (?, ?, ?, ?, ?)""",
+            (from_airport, to_airport, max_stops, stay_days, stay_days_max,
+             via_hub, hub_nights, hub_nights_max)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 from_airport.upper(),
                 to_airport.upper(),
                 max_stops,
                 stay_days,
                 stay_days_max,
+                via_hub,
+                hub_nights,
+                hub_nights_max,
             ),
         )
         await self.db.commit()
@@ -214,7 +224,8 @@ class Database:
         cursor = await self.db.execute(
             """SELECT id, from_airport, to_airport, max_stops, scan_interval,
                       stay_days, stay_days_max, target_price, alert_drop_pct,
-                      alert_on_new_low, alert_cooldown_minutes
+                      alert_on_new_low, alert_cooldown_minutes,
+                      via_hub, hub_nights, hub_nights_max
             FROM routes WHERE is_active = 1"""
         )
         rows = await cursor.fetchall()
@@ -224,7 +235,8 @@ class Database:
         cursor = await self.db.execute(
             """SELECT id, from_airport, to_airport, max_stops, scan_interval,
                       stay_days, stay_days_max, target_price, alert_drop_pct,
-                      alert_on_new_low, alert_cooldown_minutes, is_active
+                      alert_on_new_low, alert_cooldown_minutes, is_active,
+                      via_hub, hub_nights, hub_nights_max
             FROM routes WHERE id = ?""",
             (route_id,),
         )

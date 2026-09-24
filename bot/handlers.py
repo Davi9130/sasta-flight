@@ -15,6 +15,7 @@ from bot.config import (
     CURRENCY,
     DEFAULT_ALERT_COOLDOWN_MINUTES,
     INTERVAL_OPTIONS,
+    MAX_HUB_NIGHTS,
     MAX_STAY_DAYS,
     MIN_STAY_DAYS,
     TIMEZONE,
@@ -27,6 +28,7 @@ from bot.formatter import (
     format_history_message,
     format_rate_limited_message,
     format_retry_failed_message,
+    format_via_message,
 )
 from bot.fx import FxService
 from bot.scanner import (
@@ -38,6 +40,7 @@ from bot.scanner import (
     parse_airport_list,
     parse_stay_range,
     scan_route,
+    scan_via_route,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +87,10 @@ def _help_text() -> str:
         "  /add VIX MXP — one-way\n"
         "  /add VIX,GIG MXP,BGY 10 — multi-airport, 10-day stay\n"
         "  /add VIX MXP 7-10 — flexible stay range\n"
+        "/via <from> <to> <stay> [hub nights] [save]\n"
+        "  Separate tickets via São Paulo or Rio\n"
+        "  /via VIX MXP 7-10 0-2\n"
+        "  /via VIX MXP 10 1 save\n"
         "/remove <id> - Remove a route\n"
         "/routes - List active routes\n"
         "/stops - Set default stops preference\n"
@@ -185,6 +192,153 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _via_usage() -> str:
+    return (
+        "Usage: /via <from> <to> <stay> [hub nights] [save]\n"
+        "Examples:\n"
+        "/via VIX MXP 7-10 0-2 — round trip via SP/RJ, 0-2 nights at the hub\n"
+        "/via VIX MXP 10 1 — exactly 1 night in SP or Rio each way\n"
+        "/via VIX,GIG MXP 7-10 0-2 save — search and monitor"
+    )
+
+
+async def _save_via_route(origins: list[str], destinations: list[str], request) -> int:
+    hub_max = request.hub_nights_max if request.hub_nights_max != request.hub_nights_min else None
+    stay_max = request.stay_max if request.stay_max != request.stay_min else None
+    return await db.add_route(
+        ",".join(origins),
+        ",".join(destinations),
+        stay_days=request.stay_min,
+        stay_days_max=stay_max,
+        via_hub=1,
+        hub_nights=request.hub_nights_min,
+        hub_nights_max=hub_max,
+    )
+
+
+async def via_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return
+    from bot.hubs import parse_via_args
+
+    try:
+        request = parse_via_args(context.args or [])
+    except ValueError as exc:
+        code = str(exc)
+        if code == "stay":
+            await update.message.reply_text(
+                f"Stay at the destination must be between {MIN_STAY_DAYS} and {MAX_STAY_DAYS} days."
+            )
+        elif code == "hub":
+            await update.message.reply_text(
+                f"Hub nights must be between 0 and {MAX_HUB_NIGHTS} (example: 0-2)."
+            )
+        elif code == "airports":
+            await update.message.reply_text(
+                "Airport codes must be 3 letters (IATA). Use commas for multiple: VIX,GIG"
+            )
+        else:
+            await update.message.reply_text(_via_usage())
+        return
+
+    await update.message.reply_text(
+        f"Buscando {','.join(request.origins)} ⇄ {','.join(request.destinations)} via SP/RJ…"
+    )
+    result = await scan_via_route(
+        request.origins,
+        request.destinations,
+        stay_days=request.stay_min,
+        stay_days_max=request.stay_max,
+        hub_nights=request.hub_nights_min,
+        hub_nights_max=request.hub_nights_max,
+        currency=CURRENCY,
+        country=COUNTRY,
+    )
+    if result is RATE_LIMITED:
+        retry_after = circuit_retry_after_secs() or 300
+        await update.message.reply_text(
+            format_rate_limited_message(
+                ",".join(request.origins),
+                ",".join(request.destinations),
+                retry_after,
+                stay_days=request.stay_min,
+                reason=get_circuit_reason(),
+            )
+        )
+        return
+    if result is NO_MATCHES or result is None:
+        await update.message.reply_text(
+            "Nenhuma combinação via SP/RJ encontrada nessa janela. "
+            "Tente mais noites no hub ou uma estadia diferente."
+        )
+        return
+
+    saved_id = None
+    if request.save:
+        saved_id = await _save_via_route(request.origins, request.destinations, request)
+        from bot.main import schedule_scan_jobs
+
+        await schedule_scan_jobs(context.application)
+
+    fx_amounts = None
+    if fx_service:
+        try:
+            fx_amounts = await fx_service.convert(result.cheapest_price, base=result.currency)
+        except Exception:
+            logger.exception("FX conversion failed")
+
+    msg = format_via_message(result, fx_amounts=fx_amounts)
+    markup = None
+    if saved_id:
+        msg += f"\n\n✅ Monitorando (ID: {saved_id}). Alerta com /alert {saved_id} target <preço>."
+    else:
+        token = str(time.time_ns())
+        context.bot_data.setdefault("_via_pending", {})[token] = {
+            "origins": request.origins,
+            "destinations": request.destinations,
+            "stay_min": request.stay_min,
+            "stay_max": request.stay_max,
+            "hub_nights_min": request.hub_nights_min,
+            "hub_nights_max": request.hub_nights_max,
+        }
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Monitorar esta rota", callback_data=f"via_save:{token}")]]
+        )
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
+
+
+async def via_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not _is_authorized(update):
+        return
+    token = query.data.split(":", 1)[1]
+    pending = context.bot_data.get("_via_pending", {}).pop(token, None)
+    if not pending:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Essa busca expirou. Rode /via de novo.")
+        return
+    from bot.hubs import ViaRequest
+
+    request = ViaRequest(
+        origins=pending["origins"],
+        destinations=pending["destinations"],
+        stay_min=pending["stay_min"],
+        stay_max=pending["stay_max"],
+        hub_nights_min=pending["hub_nights_min"],
+        hub_nights_max=pending["hub_nights_max"],
+        save=True,
+    )
+    route_id = await _save_via_route(request.origins, request.destinations, request)
+    from bot.main import schedule_scan_jobs
+
+    await schedule_scan_jobs(context.application)
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        f"✅ Monitorando (ID: {route_id}). Alerta com /alert {route_id} target <preço>."
+    )
+
+
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return
@@ -214,6 +368,18 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _route_label(route: dict) -> str:
     stay_days = route.get("stay_days")
     stay_max = route.get("stay_days_max")
+    if route.get("via_hub"):
+        if stay_max and stay_max != stay_days:
+            stay_txt = f"{stay_days}-{stay_max}d"
+        else:
+            stay_txt = f"{stay_days}d"
+        hub = route.get("hub_nights") or 0
+        hub_max = route.get("hub_nights_max")
+        if hub_max is not None and hub_max != hub:
+            hub_txt = f"hub {hub}-{hub_max}n"
+        else:
+            hub_txt = f"hub {hub}n"
+        return f"{route['from_airport']} ⇄ {route['to_airport']} via SP/RJ ({stay_txt}, {hub_txt})"
     if stay_days:
         if stay_max and stay_max != stay_days:
             return f"{route['from_airport']} ⇄ {route['to_airport']} ({stay_days}-{stay_max}d)"
@@ -622,15 +788,30 @@ async def _scan_and_send(
         prev_cheapest = await db.get_previous_cheapest(route["id"])
         stats_before = await db.get_route_price_stats(route["id"], days=30)
 
-        result = await scan_route(
-            from_code,
-            to_code,
-            max_stops=max_stops,
-            stay_days=stay_days,
-            stay_days_max=stay_days_max,
-            currency=CURRENCY,
-            country=COUNTRY,
-        )
+        if route.get("via_hub"):
+            hub_nights = route.get("hub_nights")
+            hub_nights_max = route.get("hub_nights_max")
+            result = await scan_via_route(
+                from_code,
+                to_code,
+                stay_days=stay_days or MIN_STAY_DAYS,
+                stay_days_max=stay_days_max,
+                hub_nights=int(hub_nights or 0),
+                hub_nights_max=int(hub_nights_max) if hub_nights_max is not None else None,
+                max_stops=max_stops,
+                currency=CURRENCY,
+                country=COUNTRY,
+            )
+        else:
+            result = await scan_route(
+                from_code,
+                to_code,
+                max_stops=max_stops,
+                stay_days=stay_days,
+                stay_days_max=stay_days_max,
+                currency=CURRENCY,
+                country=COUNTRY,
+            )
 
         duration_ms = int((time.monotonic() - started) * 1000)
 
@@ -791,14 +972,33 @@ async def _scan_and_send(
         send_summary = await _should_send_summary()
 
         if send_summary:
-            msg = format_daily_message(
+            if result.fare_type == "via_hub":
+                msg = format_via_message(
+                    result,
+                    max_stops=max_stops,
+                    fx_amounts=fx_amounts,
+                    alert_lines=alert_lines or None,
+                    prev_cheapest=prev_cheapest,
+                )
+            else:
+                msg = format_daily_message(
+                    result,
+                    prev_cheapest=prev_cheapest,
+                    stops_label=stops_label,
+                    max_stops=max_stops,
+                    fx_amounts=fx_amounts,
+                    alert_lines=alert_lines or None,
+                    stats=stats_before if stats_before.get("count") else None,
+                )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            alert_sent = True
+        elif alert_lines and result.fare_type == "via_hub":
+            msg = format_via_message(
                 result,
-                prev_cheapest=prev_cheapest,
-                stops_label=stops_label,
                 max_stops=max_stops,
                 fx_amounts=fx_amounts,
-                alert_lines=alert_lines or None,
-                stats=stats_before if stats_before.get("count") else None,
+                alert_lines=alert_lines,
+                prev_cheapest=prev_cheapest,
             )
             await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
             alert_sent = True

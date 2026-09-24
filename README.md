@@ -71,6 +71,8 @@ Once the bot is running, message it on Telegram:
 /add ATQ BOM                 Add a one-way route
 /add VIX MXP 10              Round-trip with 10-day stay
 /add VIX,GIG MXP,BGY 7-10    Multi-airport + flexible stay
+/via VIX MXP 7-10 0-2        Separate tickets via SP/RJ, 0-2 hub nights
+/via VIX MXP 10 1 save       Search and monitor that combination
 /alert 1 target 2800         Notify only when cheapest ≤ 2800
 /alert 1 drop 8              Optional: also alert on ≥8% drop
 /check                       Scan now (silent unless target hit)

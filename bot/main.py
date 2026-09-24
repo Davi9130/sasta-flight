@@ -101,6 +101,8 @@ def main():
     application.add_handler(CommandHandler("frequency", handlers.frequency_command))
     application.add_handler(CallbackQueryHandler(handlers.frequency_callback, pattern=r"^freq_"))
     application.add_handler(CommandHandler("alert", handlers.alert_command))
+    application.add_handler(CommandHandler("via", handlers.via_command))
+    application.add_handler(CallbackQueryHandler(handlers.via_save_callback, pattern=r"^via_save:"))
 
     application.run_polling()
 

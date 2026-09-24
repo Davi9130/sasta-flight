@@ -431,3 +431,112 @@ def format_alert_only_message(
         f"Dates: {_format_trip_dates(result.cheapest_travel_date, result.cheapest_return_date)}"
     )
     return "\n".join(lines)
+
+
+def _nights_label(nights: int) -> str:
+    if nights <= 0:
+        return "mesmo dia"
+    if nights == 1:
+        return "1 noite"
+    return f"{nights} noites"
+
+
+def _via_leg_line(leg: dict, max_stops: str) -> str:
+    url = _flight_url(leg["from_airport"], leg["to_airport"], leg["date"], max_stops=max_stops)
+    bits = [
+        _format_date(leg["date"]),
+        f"{leg['from_airport']}→{leg['to_airport']}",
+    ]
+    if leg.get("airline"):
+        bits.append(str(leg["airline"]))
+    bits.append(_format_price(leg["price"]))
+    return f"{' · '.join(bits)}  [Book →]({url})"
+
+
+def format_via_message(
+    result: ScanResult,
+    *,
+    max_stops: str = "any",
+    fx_amounts: dict[str, float] | None = None,
+    alert_lines: list[str] | None = None,
+    prev_cheapest: float | None = None,
+) -> str:
+    from bot.hubs import city_label
+
+    stay = result.stay_days
+    stay_max = result.stay_days_max
+    if stay_max and stay_max != stay:
+        stay_txt = f"{stay}-{stay_max}d no destino"
+    else:
+        stay_txt = f"{stay}d no destino"
+    if result.hub_nights_max and result.hub_nights_max != result.hub_nights:
+        hub_txt = f"parada hub {result.hub_nights}-{result.hub_nights_max} noites"
+    elif result.hub_nights:
+        hub_txt = f"parada hub {result.hub_nights} noites"
+    else:
+        hub_txt = "parada hub 0 noites"
+
+    lines = [
+        f"✈️ {result.from_airport} ⇄ {result.to_airport} via SP/RJ | {stay_txt} | {hub_txt}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+    if alert_lines:
+        lines.extend(alert_lines)
+        lines.append("")
+
+    lines.append(
+        f"🏆 Melhor: {_format_price_multi(result.cheapest_price, result.currency, fx_amounts)}"
+    )
+    if result.direct_price is not None:
+        delta = result.direct_price - result.cheapest_price
+        if delta > 0:
+            pct = (delta / result.direct_price) * 100
+            lines.append(
+                f"   Direto: {_format_price(result.direct_price, result.currency)} (−{pct:.0f}%)"
+            )
+        else:
+            lines.append(
+                f"   Direto: {_format_price(result.direct_price, result.currency)} (via hub não ficou mais barato)"
+            )
+
+    combos = result.via_combos or result.top_days
+    if combos:
+        best = combos[0]
+        legs = best.get("legs") or []
+        if len(legs) == 4:
+            out_city = city_label(best.get("hub_out") or "")
+            back_city = city_label(best.get("hub_back") or "")
+            lines.append(f"   Ida via {out_city} ({_nights_label(best.get('nights_out') or 0)}):")
+            lines.append(f"   {_via_leg_line(legs[0], max_stops)}")
+            lines.append(f"   {_via_leg_line(legs[1], max_stops)}")
+            lines.append(f"   Volta via {back_city} ({_nights_label(best.get('nights_back') or 0)}):")
+            lines.append(f"   {_via_leg_line(legs[2], max_stops)}")
+            lines.append(f"   {_via_leg_line(legs[3], max_stops)}")
+
+    if len(combos) > 1:
+        lines.append("")
+        lines.append(f"📊 Top {len(combos)}:")
+        for i, combo in enumerate(combos, 1):
+            legs = combo.get("legs") or []
+            route_bits = " + ".join(
+                f"{leg['from_airport']}→{leg['to_airport']}" for leg in legs
+            )
+            lines.append(
+                f" {i}. {_format_date(combo['date'])} → {_format_date(combo['return_date'])} "
+                f"- {_format_price(combo['price'], result.currency)}"
+            )
+            if route_bits:
+                lines.append(f"    {route_bits}")
+
+    lines.append("")
+    lines.append(
+        "⚠️ Passagens separadas: atraso, bagagem e troca de aeroporto ficam por sua conta."
+    )
+    if prev_cheapest is not None and prev_cheapest > 0:
+        pct = ((result.cheapest_price - prev_cheapest) / prev_cheapest) * 100
+        if pct < 0:
+            lines.append(f"💡 Caiu {abs(pct):.0f}% desde o último scan")
+        elif pct > 0:
+            lines.append(f"💡 Subiu {pct:.0f}% desde o último scan")
+    return "\n".join(lines)

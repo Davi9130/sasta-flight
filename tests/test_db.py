@@ -46,6 +46,24 @@ async def test_add_and_get_routes(db):
 
 
 @pytest.mark.asyncio
+async def test_add_via_hub_route(db):
+    route_id = await db.add_route(
+        "VIX",
+        "MXP",
+        stay_days=7,
+        stay_days_max=10,
+        via_hub=1,
+        hub_nights=0,
+        hub_nights_max=2,
+    )
+    route = await db.get_route(route_id)
+    assert route["via_hub"] == 1
+    assert route["hub_nights"] == 0
+    assert route["hub_nights_max"] == 2
+    assert route["stay_days"] == 7
+
+
+@pytest.mark.asyncio
 async def test_remove_route(db):
     route_id = await db.add_route("ATQ", "BOM")
     removed = await db.remove_route(route_id)
