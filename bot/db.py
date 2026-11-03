@@ -183,9 +183,22 @@ class Database:
             os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self.db = await aiosqlite.connect(self.db_path)
         self.db.row_factory = aiosqlite.Row
+        await self._refuse_legacy_schema()
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.executescript(SCHEMA)
         await self.db.commit()
+
+    async def _refuse_legacy_schema(self):
+        cursor = await self.db.execute("PRAGMA table_info(routes)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "stay_days" in columns and "stay_min" not in columns:
+            await self.db.close()
+            self.db = None
+            raise RuntimeError(
+                f"{self.db_path} is a database from the old Fli-based bot. "
+                "Point DB_PATH at a new file (default data/sastaflight.db) and import the old one with: "
+                f"python -m scripts.import_legacy_db --legacy {self.db_path}"
+            )
 
     async def close(self):
         if self.db:

@@ -53,6 +53,17 @@ async def test_alert_dedupe_and_cooldown(db):
     assert await db.is_alert_cooling_down(rid, 60)
 
 
+async def test_refuses_to_open_legacy_database(tmp_path):
+    import pytest
+
+    legacy = tmp_path / "flights.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute("CREATE TABLE routes (id INTEGER PRIMARY KEY, stay_days INTEGER)")
+    conn.close()
+    with pytest.raises(RuntimeError, match="import_legacy_db"):
+        await Database(str(legacy)).init()
+
+
 async def test_import_legacy_db(tmp_path):
     legacy = tmp_path / "flights.db"
     conn = sqlite3.connect(legacy)
