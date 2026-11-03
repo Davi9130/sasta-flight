@@ -1,341 +1,87 @@
-import json
-import os
-
-import pytest
+import sqlite3
 
 from bot.db import Database
-
-TEST_DB = "data/test_flights.db"
-
-
-@pytest.fixture
-async def db():
-    os.makedirs("data", exist_ok=True)
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
-    database = Database(TEST_DB)
-    await database.init()
-    yield database
-    await database.close()
-    if os.path.exists(TEST_DB):
-        os.remove(TEST_DB)
-
-
-@pytest.mark.asyncio
-async def test_init_creates_tables(db):
-    config = await db.get_config("notify_time")
-    assert config == "08:00"
-    paused = await db.get_config("is_paused")
-    assert paused == "0"
-
-
-@pytest.mark.asyncio
-async def test_set_and_get_config(db):
-    await db.set_config("notify_time", "10:30")
-    assert await db.get_config("notify_time") == "10:30"
-
-
-@pytest.mark.asyncio
-async def test_add_and_get_routes(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    routes = await db.get_active_routes()
-    assert len(routes) == 1
-    assert routes[0]["id"] == route_id
-    assert routes[0]["from_airport"] == "ATQ"
-    assert routes[0]["to_airport"] == "BOM"
-
-
-@pytest.mark.asyncio
-async def test_add_via_hub_route(db):
-    route_id = await db.add_route(
-        "VIX",
-        "MXP",
-        stay_days=7,
-        stay_days_max=10,
-        via_hub=1,
-        hub_nights=0,
-        hub_nights_max=2,
-    )
-    route = await db.get_route(route_id)
-    assert route["via_hub"] == 1
-    assert route["hub_nights"] == 0
-    assert route["hub_nights_max"] == 2
-    assert route["stay_days"] == 7
-
-
-@pytest.mark.asyncio
-async def test_remove_route(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    removed = await db.remove_route(route_id)
-    assert removed is True
-    routes = await db.get_active_routes()
-    assert len(routes) == 0
-
-
-@pytest.mark.asyncio
-async def test_remove_nonexistent_route(db):
-    removed = await db.remove_route(999)
-    assert removed is False
-
-
-@pytest.mark.asyncio
-async def test_save_and_get_price_history(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    price_data = json.dumps([{"date": "2026-03-18", "price": 3200}])
-    await db.save_price_history(
-        route_id=route_id,
-        scan_date="2026-03-07",
-        cheapest_travel_date="2026-03-18",
-        cheapest_price=3200.0,
-        cheapest_airline="IndiGo",
-        avg_price=5200.0,
-        price_data=price_data,
-        currency="BRL",
-    )
-    history = await db.get_price_history(route_id, days=7)
-    assert len(history) == 1
-    assert history[0]["cheapest_price"] == 3200.0
-    assert history[0]["currency"] == "BRL"
-
-
-@pytest.mark.asyncio
-async def test_add_route_with_stay_days(db):
-    route_id = await db.add_route("VIX", "MXP", stay_days=10)
-    routes = await db.get_active_routes()
-    assert routes[0]["stay_days"] == 10
-    assert routes[0]["id"] == route_id
-
-
-@pytest.mark.asyncio
-async def test_add_route_with_stay_range(db):
-    route_id = await db.add_route("VIX", "MXP", stay_days=7, stay_days_max=10)
-    routes = await db.get_active_routes()
-    assert routes[0]["stay_days"] == 7
-    assert routes[0]["stay_days_max"] == 10
-    assert routes[0]["id"] == route_id
-
-
-@pytest.mark.asyncio
-async def test_save_price_history_with_return_date(db):
-    route_id = await db.add_route("VIX", "MXP", stay_days=10)
-    await db.save_price_history(
-        route_id=route_id,
-        scan_date="2026-03-07",
-        cheapest_travel_date="2026-03-18",
-        cheapest_return_date="2026-03-28",
-        cheapest_price=4500.0,
-        cheapest_airline="TAP",
-        avg_price=5100.0,
-        price_data=None,
-    )
-    history = await db.get_price_history(route_id, days=7)
-    assert history[0]["cheapest_return_date"] == "2026-03-28"
-
-
-@pytest.mark.asyncio
-async def test_init_creates_stops_preference(db):
-    config = await db.get_config("stops_preference")
-    assert config == "any"
-
-
-@pytest.mark.asyncio
-async def test_add_route_default_max_stops(db):
-    await db.add_route("ATQ", "BOM")
-    routes = await db.get_active_routes()
-    assert routes[0]["max_stops"] is None
-
-
-@pytest.mark.asyncio
-async def test_add_route_with_max_stops(db):
-    await db.add_route("ATQ", "BOM", max_stops="direct")
-    routes = await db.get_active_routes()
-    assert routes[0]["max_stops"] == "direct"
-
-
-@pytest.mark.asyncio
-async def test_set_route_stops(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    updated = await db.set_route_stops(route_id, "1stop")
-    assert updated is True
-    routes = await db.get_active_routes()
-    assert routes[0]["max_stops"] == "1stop"
-
-
-@pytest.mark.asyncio
-async def test_set_route_stops_nonexistent(db):
-    updated = await db.set_route_stops(999, "direct")
-    assert updated is False
-
-
-@pytest.mark.asyncio
-async def test_get_route_stops_preference_per_route(db):
-    route_id = await db.add_route("ATQ", "BOM", max_stops="direct")
-    pref = await db.get_route_stops_preference(route_id)
-    assert pref == "direct"
-
-
-@pytest.mark.asyncio
-async def test_get_route_stops_preference_falls_back_to_global(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    pref = await db.get_route_stops_preference(route_id)
-    assert pref == "any"
-
-
-@pytest.mark.asyncio
-async def test_get_route_stops_preference_custom_global(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    await db.set_config("stops_preference", "1stop")
-    pref = await db.get_route_stops_preference(route_id)
-    assert pref == "1stop"
-
-
-@pytest.mark.asyncio
-async def test_init_creates_scan_interval_config(db):
-    config = await db.get_config("scan_interval")
-    assert config == "1440"
-
-
-@pytest.mark.asyncio
-async def test_routes_have_scan_interval_column(db):
-    await db.add_route("ATQ", "BOM")
-    routes = await db.get_active_routes()
-    assert routes[0]["scan_interval"] is None
-
-
-@pytest.mark.asyncio
-async def test_set_route_scan_interval(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    updated = await db.set_route_scan_interval(route_id, "120")
-    assert updated is True
-    routes = await db.get_active_routes()
-    assert routes[0]["scan_interval"] == "120"
-
-
-@pytest.mark.asyncio
-async def test_set_route_scan_interval_invalid(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    updated = await db.set_route_scan_interval(route_id, "45")
-    assert updated is False
-    routes = await db.get_active_routes()
-    assert routes[0]["scan_interval"] is None
-
-
-@pytest.mark.asyncio
-async def test_set_route_scan_interval_nonexistent(db):
-    updated = await db.set_route_scan_interval(999, "120")
-    assert updated is False
-
-
-@pytest.mark.asyncio
-async def test_get_route_scan_interval_per_route(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    await db.set_route_scan_interval(route_id, "120")
-    interval = await db.get_route_scan_interval(route_id)
-    assert interval == 120
-
-
-@pytest.mark.asyncio
-async def test_get_route_scan_interval_falls_back_to_global(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    interval = await db.get_route_scan_interval(route_id)
-    assert interval == 1440
-
-
-@pytest.mark.asyncio
-async def test_get_route_scan_interval_custom_global(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    await db.set_config("scan_interval", "360")
-    interval = await db.get_route_scan_interval(route_id)
-    assert interval == 360
-
-
-@pytest.mark.asyncio
-async def test_save_price_history_upserts_same_day(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    await db.save_price_history(
-        route_id=route_id,
-        scan_date="2026-03-07",
-        cheapest_travel_date="2026-03-18",
-        cheapest_price=3200.0,
-        cheapest_airline="IndiGo",
-        avg_price=5200.0,
-        price_data=None,
-    )
-    await db.save_price_history(
-        route_id=route_id,
-        scan_date="2026-03-07",
-        cheapest_travel_date="2026-03-20",
-        cheapest_price=2900.0,
-        cheapest_airline="SpiceJet",
-        avg_price=4800.0,
-        price_data=None,
-    )
-    history = await db.get_price_history(route_id, days=7)
-    assert len(history) == 1
-    assert history[0]["cheapest_price"] == 2900.0
-    assert history[0]["cheapest_airline"] == "SpiceJet"
-
-
-@pytest.mark.asyncio
-async def test_fare_snapshots_keep_intraday(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    run1 = await db.create_scan_run(route_id, "ok", cheapest_price=3200, currency="BRL")
-    await db.save_fare_snapshots(
-        route_id,
-        run1,
-        [{"date": "2026-03-18", "price": 3200, "from_airport": "ATQ", "to_airport": "BOM", "is_cheapest": True}],
-        "BRL",
-    )
-    run2 = await db.create_scan_run(route_id, "ok", cheapest_price=3000, currency="BRL")
-    await db.save_fare_snapshots(
-        route_id,
-        run2,
-        [{"date": "2026-03-18", "price": 3000, "from_airport": "ATQ", "to_airport": "BOM", "is_cheapest": True}],
-        "BRL",
-    )
-    snaps = await db.get_fare_history(route_id, limit=10)
-    assert len(snaps) == 2
-    assert snaps[0]["price"] == 3000
-
-
-@pytest.mark.asyncio
-async def test_fx_rate_cache(db):
-    await db.save_fx_rate("BRL", "USD", 0.18, source="frankfurter", as_of_date="2026-07-17")
-    row = await db.get_fx_rate("BRL", "USD")
-    assert row["rate"] == 0.18
-    assert row["source"] == "frankfurter"
-
-
-@pytest.mark.asyncio
-async def test_alert_event_dedupe(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    ok = await db.record_alert_event(route_id, "drop", 3000, "fp1", currency="BRL")
-    dup = await db.record_alert_event(route_id, "drop", 3000, "fp1", currency="BRL")
-    assert ok is True
-    assert dup is False
-
-
-@pytest.mark.asyncio
-async def test_route_alerts_config(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    await db.set_route_alert(route_id, target_price=2500, alert_drop_pct=8)
-    route = await db.get_route(route_id)
-    assert route["target_price"] == 2500
-    assert route["alert_drop_pct"] == 8
-
-
-@pytest.mark.asyncio
-async def test_price_stats_median(db):
-    route_id = await db.add_route("ATQ", "BOM")
-    for price in [3000, 3200, 4000]:
-        run = await db.create_scan_run(route_id, "ok", cheapest_price=price, currency="BRL")
-        await db.save_fare_snapshots(
-            route_id,
-            run,
-            [{"date": "2026-03-18", "price": price, "from_airport": "ATQ", "to_airport": "BOM", "is_cheapest": True}],
-            "BRL",
+from scripts.import_legacy_db import run as import_legacy
+
+
+async def test_route_crud_and_preferences(db):
+    rid = await db.add_route("vix,gig", "mxp", stay_min=7, stay_max=10)
+    route = await db.get_route(rid)
+    assert route["from_airport"] == "VIX,GIG" and route["stay_max"] == 10
+    assert await db.get_route_stops_preference(route) == "any"
+    await db.set_route_stops(rid, "direct")
+    assert await db.get_route_stops_preference(await db.get_route(rid)) == "direct"
+    assert await db.get_route_scan_interval(route) == 1440
+    await db.set_route_scan_interval(rid, "360")
+    assert await db.get_route_scan_interval(await db.get_route(rid)) == 360
+    assert await db.set_route_alert(rid, target_price=2500)
+    assert (await db.get_route(rid))["target_price"] == 2500
+    await db.clear_route_alerts(rid)
+    assert (await db.get_route(rid))["target_price"] is None
+    assert await db.remove_route(rid)
+    assert not await db.remove_route(rid)
+    assert await db.get_active_routes() == []
+
+
+async def test_history_snapshots_and_stats(db):
+    rid = await db.add_route("VIX", "GRU")
+    run_id = await db.create_scan_run(rid, "ok", cheapest_price=900, requests_used=12)
+    days = [
+        {"date": "2026-12-01", "price": 900, "from_airport": "VIX", "to_airport": "GRU"},
+        {"date": "2026-12-02", "price": 950, "from_airport": "VIX", "to_airport": "GRU"},
+    ]
+    await db.save_fare_snapshots(rid, run_id, days, "BRL")
+    for price in (1000, 900):
+        await db.save_price_history(
+            rid, scan_date="2026-11-03", cheapest_travel_date="2026-12-01", cheapest_return_date=None,
+            cheapest_price=price, cheapest_airline="X", avg_price=price, price_data=days,
+            currency="BRL", provider="fake", fare_type="oneway",
         )
-    stats = await db.get_route_price_stats(route_id, days=30)
-    assert stats["count"] == 3
-    assert stats["min"] == 3000
-    assert stats["median"] == 3200
+    history = await db.get_price_history(rid)
+    assert len(history) == 1 and history[0]["cheapest_price"] == 900
+    stats = await db.get_route_price_stats(rid)
+    assert stats["count"] == 1 and stats["min"] == 900
+    assert await db.get_previous_cheapest(rid) == 900
+    assert await db.get_pair_best_prices(rid) == {("VIX", "GRU"): 900}
+
+
+async def test_alert_dedupe_and_cooldown(db):
+    rid = await db.add_route("VIX", "GRU")
+    assert not await db.is_alert_cooling_down(rid, 60)
+    assert await db.record_alert_event(rid, "target", 900, "fp1")
+    assert not await db.record_alert_event(rid, "target", 900, "fp1")
+    assert await db.is_alert_cooling_down(rid, 60)
+
+
+async def test_import_legacy_db(tmp_path):
+    legacy = tmp_path / "flights.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript(
+        """
+        CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE routes (id INTEGER PRIMARY KEY, from_airport TEXT, to_airport TEXT,
+            max_stops TEXT, is_active INTEGER, created_at TEXT, scan_interval TEXT,
+            stay_days INTEGER, stay_days_max INTEGER, target_price REAL,
+            via_hub INTEGER, hub_nights INTEGER, hub_nights_max INTEGER);
+        CREATE TABLE price_history (id INTEGER PRIMARY KEY, route_id INTEGER, scan_date TEXT,
+            cheapest_travel_date TEXT, cheapest_price REAL, cheapest_airline TEXT,
+            avg_price REAL, price_data TEXT, scanned_at TEXT);
+        INSERT INTO config VALUES ('notify_time', '07:30');
+        INSERT INTO routes VALUES (7, 'VIX', 'MXP', 'direct', 1, '2026-01-01', NULL, 7, 10, 2800, 0, NULL, NULL);
+        INSERT INTO price_history VALUES (1, 7, '2026-10-01', '2026-11-01', 3000, 'TAP', 3200, '[]', '2026-10-01');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    target = str(tmp_path / "new.db")
+    assert await import_legacy(str(legacy), target) == (1, 1)
+    assert await import_legacy(str(legacy), target) == (0, 0)
+
+    db = Database(target)
+    await db.init()
+    route = await db.get_route(7)
+    assert (route["stay_min"], route["stay_max"], route["target_price"]) == (7, 10, 2800)
+    assert (await db.get_price_history(7))[0]["cheapest_price"] == 3000
+    assert await db.get_config("notify_time") == "07:30"
+    await db.close()

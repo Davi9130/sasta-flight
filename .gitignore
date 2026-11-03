@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 data/*.db
+data/*.db-*
 .venv/
 .worktrees/

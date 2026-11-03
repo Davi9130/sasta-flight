@@ -1,162 +1,141 @@
 # SastaFlight ✈️
 
-Daily flight price scanner Telegram bot. Scans Google Flights for the cheapest days to fly on your routes, tracks price history, and alerts you on deals.
+A Telegram bot that scans Google Flights on a schedule. It finds the cheapest days to fly on your saved routes, tracks price history, and alerts you when a route hits your target price.
 
-**What it does:** On a schedule (or on demand), you get a Telegram message with the cheapest confirmed days in the next N days for each saved route — with prices in your main currency plus ≈ EUR / USD, airlines, trends, and booking links.
+Fares come from [fast-flights](https://github.com/AWeirdDev/flights). Every Google request goes through a guard that budgets, paces and pauses traffic, so the server's IP doesn't get blocked.
 
 ## Quick Start
 
-### 1. Create a Telegram Bot
+### 1. Create a Telegram bot
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot` and follow the prompts
-3. Copy the bot token
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the token.
+2. Message [@userinfobot](https://t.me/userinfobot) and copy your chat `Id`.
 
-### 2. Get Your Chat ID
+### 2. Run
 
-1. Message [@userinfobot](https://t.me/userinfobot) on Telegram
-2. Copy the `Id` number
-
-### 3. Deploy
-
-#### Option A: Railway
-
-1. Go to [railway.com](https://railway.com) and sign up / log in
-2. Click **New Project** → **GitHub Repository**
-3. Connect your GitHub and select `sasta-flight`
-4. Go to **Variables** tab and add:
-   - `TELEGRAM_BOT_TOKEN` = your bot token
-   - `TELEGRAM_CHAT_ID` = your chat ID
-5. Railway will build and deploy automatically
-6. (Optional) Add a volume mounted at `/app/data` for persistent database storage
-
-#### Option B: DigitalOcean App Platform
-
-1. Go to [cloud.digitalocean.com/apps](https://cloud.digitalocean.com/apps) and sign up / log in
-2. Click **Create App** → **GitHub** → select `sasta-flight`
-3. Choose **Worker** (not web service, since this is a bot)
-4. Set environment variables:
-   - `TELEGRAM_BOT_TOKEN` = your bot token
-   - `TELEGRAM_CHAT_ID` = your chat ID
-5. Pick the cheapest plan ($5/mo) and deploy
-
-#### Option C: Docker Compose (Any VPS)
+#### Docker Compose (any VPS)
 
 ```bash
-git clone https://github.com/Pankaj3112/sasta-flight.git
-cd sasta-flight
-cp .env.example .env
-# Edit .env with your bot token and chat ID
+cp .env.example .env   # set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
 docker compose up -d
 ```
 
-#### Option D: Run Locally
+#### Locally
 
 ```bash
-git clone https://github.com/Pankaj3112/sasta-flight.git
-cd sasta-flight
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your bot token and chat ID
 python -m bot.main
+```
+
+Railway or DigitalOcean also work. Deploy it as a worker (not a web service), set the two Telegram variables, and mount a volume at `/app/data` so the database survives redeploys.
+
+### Coming from the Fli-based version?
+
+The new database is `data/sastaflight.db`. To import your routes (IDs are kept), settings and daily price history from the old file, run:
+
+```bash
+python -m scripts.import_legacy_db --legacy data/flights.db
 ```
 
 ## Usage
 
-Once the bot is running, message it on Telegram:
-
 ```
-/add ATQ BOM                 Add a one-way route
-/add VIX MXP 10              Round-trip with 10-day stay
+/add ATQ BOM                 One-way route
+/add VIX MXP 10              Round trip, 10-day stay
 /add VIX,GIG MXP,BGY 7-10    Multi-airport + flexible stay
 /via VIX MXP 7-10 0-2        Separate tickets via SP/RJ, 0-2 hub nights
 /via VIX MXP 10 1 save       Search and monitor that combination
 /alert 1 target 2800         Notify only when cheapest ≤ 2800
 /alert 1 drop 8              Optional: also alert on ≥8% drop
-/check                       Scan now (silent unless target hit)
-/routes                      List saved routes
-/remove 1                    Remove route by ID
-/time 07:30                  Change scan start time
-/history                     Price trend + median/low
-/pause                       Pause scheduled scans
-/resume                      Resume scheduled scans
-/help                        Show all commands
+/alert 1 low on              Optional: alert on a new historical low
+/alert 1 clear               Remove alert rules
+/check                       Scan all routes now (silent unless an alert fires)
+/routes                      List routes (buttons to change stops / frequency)
+/stops                       Default stops preference
+/frequency                   Default scan frequency (1h … 24h)
+/time 07:30                  Daily start time that scan slots align to
+/history                     Price trend + median / low
+/status                      Google request budget, pause state, proxies, queue
+/remove 1                    Remove route
+/pause  /resume              Pause or resume scheduled scans
 ```
 
-By default the bot **does not** spam every scan. It keeps checking and saving history; Telegram messages go out when a route hits its `/alert … target` price (or on errors/rate-limits).
-## Daily Message Example
+Scans are silent by default. History is always saved, and a message goes out only when an alert rule fires, or when scans get postponed by the anti-block guard. Set `ALWAYS_SEND_SCAN_SUMMARY=1` to get the full summary after every scan.
+
+## How it works
+
+### Searching without a calendar API
+
+fast-flights prices one date (or one date pair) per request; there is no "whole month" endpoint. Each scan therefore runs in two phases under a per-scan request budget:
+
+1. **Coarse pass.** It samples the window evenly, by default every `COARSE_STEP_DAYS` days or wider if the budget requires it. For flexible stays it samples the shortest, longest and middle stay. With multiple airports, pairs it has never seen go first, then pairs that were cheapest before.
+2. **Refinement.** It takes the `REFINE_TOP_K` cheapest results and checks neighbouring days (±1, then ±2) and neighbouring stay lengths. It walks outward while that keeps finding cheaper fares.
+
+Each answer is already a confirmed price with airline, times, stops and duration. With `ENABLE_SPLIT_TICKETS=1`, the best round trips are also compared against two one-way tickets.
+
+`/via` works the same way, leg by leg. It samples the long-haul legs from the hubs (`VIA_LONGHAUL_HUBS`) first, because they drive the price. Then it prices the return legs for the best outbound dates, and finally the positioning flights to and from São Paulo or Rio, but only around the cheapest long-haul pairs. A same-day self-transfer must leave at least `MIN_SELF_TRANSFER_HOURS` between flights.
+
+### Not getting blocked
+
+- **A single queue.** Only one scan runs at a time, and route jobs are staggered and jittered (±`SCHEDULE_JITTER_MINS`).
+- **Pacing.** Each request waits a random `REQ_JITTER_MIN_SECS` to `REQ_JITTER_MAX_SECS` seconds after the previous one.
+- **Budgets per scan, per hour and per day.** They're stored in SQLite. When a budget runs out, the scan is postponed and retried automatically, without pushing more requests at Google.
+- **Explicit block detection.** HTTP 429/403/503, the `/sorry/` captcha page, consent pages, or a page without flight data all count as a block. Network errors don't.
+- **A persistent circuit breaker.** On a direct connection, a block pauses every Google request for `BLOCK_COOLDOWN_SECS`. The pause doubles on each consecutive block, up to `BLOCK_COOLDOWN_MAX_SECS`. The pause survives restarts, and you get one Telegram notice per episode, not one per route.
+- **Optional proxies** (`PROXY_URLS`). Requests rotate across proxies. A blocked proxy is quarantined for `PROXY_QUARANTINE_SECS` while the others keep working. Residential proxies are what actually fix repeated blocks.
+- **A quote cache** (`QUOTE_CACHE_TTL_MINS`). Overlapping routes, `/check` and `/via` reuse recent answers for free.
+
+Check `/status` at any time to see how much of the budget is used and whether Google is paused.
+
+There is no official Google Flights API. fast-flights reads Google's public results page, so it can break when Google changes that page. Tests include a real captured payload (`tests/fixtures/`) to catch parser changes.
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TELEGRAM_BOT_TOKEN` | — | Bot token from @BotFather (required) |
+| `TELEGRAM_CHAT_ID` | — | Your chat ID (required; other chats are ignored) |
+| `TIMEZONE` | `America/Sao_Paulo` | Scheduling timezone |
+| `CURRENCY` | `BRL` | `BRL`, `USD`, `EUR` or `GBP` (EUR/USD shown as ≈ via Frankfurter) |
+| `DAYS_TO_SCAN` | `30` | Outbound window starting tomorrow |
+| `TOP_CHEAPEST` | `5` | Days listed per message |
+| `MAX_AIRPORT_COMBOS` | `4` | Cap on origin × destination pairs |
+| `ENABLE_SPLIT_TICKETS` | `0` | Compare round trip vs two one-ways (2 extra requests per candidate) |
+| `ALWAYS_SEND_SCAN_SUMMARY` | `0` | `1` = message after every scan |
+| `DEFAULT_ALERT_COOLDOWN_MINUTES` | `360` | Minimum gap between alerts for a route |
+| `PROXY_URLS` | empty | Comma-separated proxies (`http://user:pass@host:port`, `socks5://…`) |
+| `REQ_BUDGET_PER_SCAN` | `25` (`40` with proxies) | Google requests one route scan may use |
+| `REQ_BUDGET_PER_HOUR` | `60` (`200`) | Global hourly cap |
+| `REQ_BUDGET_PER_DAY` | `400` (`2000`) | Global daily cap |
+| `REQ_JITTER_MIN_SECS` / `REQ_JITTER_MAX_SECS` | `4` / `9` (`2` / `5`) | Random gap between requests |
+| `BLOCK_COOLDOWN_SECS` | `1800` | First pause after a block (doubles per consecutive block) |
+| `BLOCK_COOLDOWN_MAX_SECS` | `21600` | Longest pause |
+| `PROXY_QUARANTINE_SECS` | `1800` | How long a blocked proxy sits out |
+| `QUOTE_CACHE_TTL_MINS` | `180` | Reuse answers for this long |
+| `SCHEDULE_JITTER_MINS` | `10` | Random delay added to each scheduled scan |
+| `COARSE_STEP_DAYS` | `3` | Minimum spacing of the coarse pass |
+| `REFINE_TOP_K` / `REFINE_RADIUS_DAYS` | `3` / `2` | Refinement breadth / depth |
+| `VIA_BUDGET_PER_SCAN` | `40` (`60`) | Request budget for one `/via` search |
+| `VIA_LONGHAUL_HUBS` | `GRU,GIG` | Long-haul airports considered for `/via` |
+| `MIN_SELF_TRANSFER_HOURS` | `4` | Minimum same-day self-transfer gap |
+| `DB_PATH` | `data/sastaflight.db` | SQLite database |
+
+A rough sizing rule: a round trip with a 7-10 day stay over 30 days uses about 25 requests per scan. Without proxies, the defaults allow roughly two such scans per hour, so keep the scan frequency at 6h or slower when you track several routes.
+
+## Project layout
 
 ```
-✈️ VIX,GIG ⇄ MXP | Next 30 Days | 7-10-day stay
-━━━━━━━━━━━━━━━━━━━━━━
-
-🏆 Cheapest: Mar 18 (Tue) → Mar 28 (Fri) - R$4,500 (≈ €720 / $780)
-   Airports: GIG → MXP
-   TAP | 08:30 PM | 12h 15m | 1 stop
-
-📊 Top 5 Cheapest Days:
- 1. Mar 18 (Tue) → Mar 28 (Fri) - R$4,500  [Book →]
- 2. Mar 20 (Thu) → Mar 30 (Sat) - R$4,720  [Book →]
-
-📈 Avg: R$5,100 | Low: R$4,500 | High: R$6,200
-📉 Hist median: R$5,300 | Hist low: R$4,400
-
-💡 Trend: Prices dropped 8% since last scan
+bot/
+  fares/       client.py (fast-flights + block detection), guard.py, cache.py, service.py
+  search/      planner.py (date sampling), scan.py (routes, split tickets), hubs.py (/via)
+  runner.py    scan → persist → alerts → Telegram
+  scheduler.py per-route jobs feeding one serial queue
+  handlers.py  Telegram commands
+  db.py  formatter.py  alerts.py  fx.py  config.py  main.py
+scripts/import_legacy_db.py
 ```
-
-EUR/USD amounts are **approximate** conversions (Frankfurter / central-bank rates), not live airline quotes in those currencies.
-
-Split-ticket deals (separate one-way fares cheaper than a round-trip package) are labeled clearly and get two booking links. Separate tickets are riskier (missed connection, baggage, schedule changes).
-
-## Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | — | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | Yes | — | Your Telegram chat ID |
-| `DAYS_TO_SCAN` | No | `30` | Days ahead to scan |
-| `TOP_CHEAPEST` | No | `5` | How many cheapest days to show |
-| `CANDIDATE_POOL` | No | `6` | Calendar candidates to confirm in detail |
-| `MAX_CONCURRENT_SEARCHES` | No | `1` | Parallel detail lookups (keep at 1 to avoid 429) |
-| `MAX_AIRPORT_COMBOS` | No | `6` | Cap on origin×destination pairs |
-| `ENABLE_SPLIT_TICKETS` | No | `0` | Compare OW+OW vs round-trip (extra API calls) |
-| `SEARCH_MIN_INTERVAL_SECS` | No | `2.0` | Minimum gap between Google Flights calls |
-| `SEARCH_429_MAX_RETRIES` | No | `4` | Retries on HTTP 429 with backoff |
-| `SEARCH_429_BASE_DELAY_SECS` | No | `8` | Base delay for 429 exponential backoff |
-| `SEARCH_CIRCUIT_THRESHOLD` | No | `3` | Consecutive 429s before circuit opens |
-| `SEARCH_CIRCUIT_COOLDOWN_SECS` | No | `300` | Pause scans while circuit is open |
-| `CALENDAR_CHUNK_DAYS` | No | `30` | Split long calendars into chunks |
-| `CALENDAR_CHUNK_PAUSE_SECS` | No | `3` | Pause between calendar chunks |
-| `STAY_SAMPLE_STEP` | No | `1` | Sample every N days in a stay range (use `2` for wide ranges) |
-| `TIMEZONE` | No | `Asia/Kolkata` | Timezone for scheduling |
-| `CURRENCY` | No | `BRL` | Primary currency (`BRL`, `USD`, `EUR`, `GBP`) |
-| `ALWAYS_SEND_SCAN_SUMMARY` | No | `0` | `1` = full summary every scan; `0` = notify only on target/alerts |
-| `DEFAULT_ALERT_DROP_PCT` | No | `5` | Suggested % for `/alert <id> drop` (not auto-applied) |
-| `DEFAULT_ALERT_COOLDOWN_MINUTES` | No | `360` | Min minutes between alerts |
-| `FARE_PROVIDER` | No | `fli` | Fare provider (`fli` today; extension point) |
-| `DB_PATH` | No | `data/flights.db` | SQLite database path |
-
-## How It Works
-
-1. **Calendar pool** — uses [Fli](https://github.com/punitarani/fli) (`SearchDates`) to score candidate dates (and optional airport / stay combinations), chunked for long windows.
-2. **Confirm + re-rank** — fetches detailed cheapest flights for the candidate pool (rate-limited), then sorts by **confirmed** price (not calendar estimate).
-3. **Rate limiting** — global min-interval between Google calls, exponential backoff on HTTP 429, and a circuit breaker that pauses scans when Google keeps blocking.
-4. **Multi-currency display** — quotes are requested in `CURRENCY`; EUR/USD equivalents come from [Frankfurter](https://frankfurter.dev/) with SQLite cache.
-5. **Tracking** — each scan writes `scan_runs` + `fare_snapshots` (intraday history) and a daily `price_history` row for charts.
-6. **Alerts** — by default silent; notify when `target_price` is hit (`/alert <id> target`). Optional drop % / new-low only if explicitly enabled on the route.
-
-There is **no official public Google Flights API**. Fli talks to Google’s unofficial internal endpoints and can break or be rate-limited. The bot wraps fares behind a `FareProvider` interface so a future paid/affiliate provider can be plugged in without rewriting handlers.
-
-## Tech Stack
-
-- Python 3.12
-- [Fli](https://github.com/punitarani/fli) — Google Flights data (no API key)
-- [Frankfurter](https://frankfurter.dev/) — FX rates (no API key)
-- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) — Telegram bot
-- SQLite — history, FX cache, alerts
-- Docker — containerized deployment
 
 ## Tests
 
